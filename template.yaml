@@ -553,6 +553,8 @@ Outputs:
   UserPoolId:
     Description: Cognito User Pool ID
     Value: !Ref UserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
 
   UserPoolClientId:
     Description: Cognito User Pool Client ID
@@ -561,11 +563,15 @@ Outputs:
   UserPoolDomain:
     Description: Cognito User Pool Domain
     Value: !Sub '${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolDomain'
 
   # AgentCore outputs
   AgentCoreFunctionArn:
     Description: AgentCore Lambda function ARN (for MCP gateway)
     Value: !GetAtt AgentCoreFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentCoreFunctionArn'
 
   AgentCoreFunctionName:
     Description: AgentCore Lambda function name

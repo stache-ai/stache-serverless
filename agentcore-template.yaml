@@ -1,0 +1,317 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Stache AI - AgentCore MCP Gateway
+  Deploys MCP gateway with Cognito OAuth for Claude Web integration.
+  Run after the main stache-serverless stack is deployed.
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Description: Resource prefix (must match main stack)
+    Default: "stache"
+  MainStackName:
+    Type: String
+    Description: Name of the main stache-serverless stack
+    Default: "stache-serverless"
+
+Resources:
+  # MCP Resource Server - defines custom OAuth scopes for MCP access
+  MCPResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !ImportValue
+        Fn::Sub: '${MainStackName}-UserPoolId'
+      Identifier: !Sub '${ResourcePrefix}-mcp'
+      Name: !Sub '${ResourcePrefix} MCP API'
+      Scopes:
+        - ScopeName: read
+          ScopeDescription: Read access to knowledge base
+        - ScopeName: write
+          ScopeDescription: Write access to knowledge base
+
+  # MCP Confidential Client - OAuth client for Claude Web
+  # Claude requires client_id + client_secret to be provided manually
+  MCPUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: MCPResourceServer
+    Properties:
+      ClientName: !Sub '${ResourcePrefix}-mcp-client'
+      UserPoolId: !ImportValue
+        Fn::Sub: '${MainStackName}-UserPoolId'
+      GenerateSecret: true
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - phone
+        - profile
+        - !Sub '${ResourcePrefix}-mcp/read'
+        - !Sub '${ResourcePrefix}-mcp/write'
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs:
+        - 'http://127.0.0.1:33418'
+        - 'https://claude.ai/api/mcp/auth_callback'
+        - 'https://vscode.dev/redirect'
+      SupportedIdentityProviders:
+        - COGNITO
+
+  # IAM Role for AgentCore Gateway to invoke Lambda
+  AgentCoreGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-agentcore-gateway-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - bedrock.amazonaws.com
+                - bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !ImportValue
+                      Fn::Sub: '${MainStackName}-AgentCoreFunctionArn'
+
+  # Lambda permission for Bedrock to invoke
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-agentcore'
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+      SourceArn: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:gateway/*'
+
+  # AgentCore MCP Gateway
+  MCPGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    DependsOn:
+      - AgentCoreGatewayRole
+      - MCPUserPoolClient
+    Properties:
+      Name: !Sub '${ResourcePrefix}-mcp-gateway'
+      Description: Stache AI MCP Gateway
+      ProtocolType: MCP
+      AuthorizerType: CUSTOM_JWT
+      RoleArn: !GetAtt AgentCoreGatewayRole.Arn
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub
+            - 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}/.well-known/openid-configuration'
+            - UserPoolId: !ImportValue
+                Fn::Sub: '${MainStackName}-UserPoolId'
+          AllowedClients:
+            - !Ref MCPUserPoolClient
+
+  # Gateway Target - Lambda with tool schema
+  MCPGatewayTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    DependsOn: MCPGateway
+    Properties:
+      GatewayIdentifier: !Ref MCPGateway
+      Name: !Sub '${ResourcePrefix}-tools'
+      Description: Stache AI MCP tools
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !ImportValue
+              Fn::Sub: '${MainStackName}-AgentCoreFunctionArn'
+            ToolSchema:
+              InlinePayload:
+                - Name: search
+                  Description: Search your knowledge base for relevant information. Use when the user asks about their saved documents, notes, or uploaded files.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      query:
+                        Type: string
+                        Description: Natural language search query
+                      namespace:
+                        Type: string
+                        Description: Optional namespace to search within
+                      top_k:
+                        Type: integer
+                        Description: Number of results to return (max 50, default 20)
+                      rerank:
+                        Type: boolean
+                        Description: Rerank results for relevance (default true)
+                    Required:
+                      - query
+                - Name: ingest_text
+                  Description: Add text content to the knowledge base. Use to save notes, documentation, or any text the user wants to remember.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      text:
+                        Type: string
+                        Description: Text content to ingest (max 100KB)
+                      metadata:
+                        Type: object
+                        Description: Optional metadata to attach to the ingested content
+                      namespace:
+                        Type: string
+                        Description: Optional namespace to organize content (default 'default')
+                    Required:
+                      - text
+                - Name: list_namespaces
+                  Description: List all namespaces in the knowledge base. Use to discover what knowledge domains are available before searching.
+                  InputSchema:
+                    Type: object
+                    Properties: {}
+                - Name: list_documents
+                  Description: List documents in the knowledge base. Use to see what content has been indexed.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      namespace:
+                        Type: string
+                        Description: Filter documents by namespace
+                      limit:
+                        Type: integer
+                        Description: Maximum documents to return (max 100, default 100)
+                      next_key:
+                        Type: string
+                        Description: Pagination token from previous response
+                - Name: get_document
+                  Description: Get metadata for a specific document by ID.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      doc_id:
+                        Type: string
+                        Description: Document UUID
+                      namespace:
+                        Type: string
+                        Description: Namespace containing the document (default 'default')
+                    Required:
+                      - doc_id
+                - Name: delete_document
+                  Description: Delete a document and all its chunks from the knowledge base. Use to remove content that is no longer needed or to re-ingest with updates.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      doc_id:
+                        Type: string
+                        Description: Document UUID to delete
+                      namespace:
+                        Type: string
+                        Description: Namespace containing the document (default 'default')
+                    Required:
+                      - doc_id
+                - Name: create_namespace
+                  Description: Create a new namespace to organize knowledge. Use namespaces to separate different topics, projects, or knowledge domains.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      id:
+                        Type: string
+                        Description: Unique namespace ID (slug format, e.g., 'projects/acme' or 'research/ml')
+                      name:
+                        Type: string
+                        Description: Display name for the namespace
+                      description:
+                        Type: string
+                        Description: Description of what belongs in this namespace
+                      parent_id:
+                        Type: string
+                        Description: Optional parent namespace ID for hierarchy
+                    Required:
+                      - id
+                      - name
+                - Name: get_namespace
+                  Description: Get details about a specific namespace.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      id:
+                        Type: string
+                        Description: Namespace ID to retrieve
+                    Required:
+                      - id
+                - Name: update_namespace
+                  Description: Update an existing namespace's name, description, or metadata.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      id:
+                        Type: string
+                        Description: Namespace ID to update
+                      name:
+                        Type: string
+                        Description: New display name
+                      description:
+                        Type: string
+                        Description: New description
+                    Required:
+                      - id
+                - Name: delete_namespace
+                  Description: Delete a namespace. Use cascade=true to also delete child namespaces.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      id:
+                        Type: string
+                        Description: Namespace ID to delete
+                      cascade:
+                        Type: boolean
+                        Description: If true, also delete child namespaces (default false)
+                    Required:
+                      - id
+
+Outputs:
+  MCPClientId:
+    Description: Cognito MCP Client ID
+    Value: !Ref MCPUserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-MCPClientId'
+
+  GatewayRoleArn:
+    Description: IAM Role ARN for AgentCore Gateway
+    Value: !GetAtt AgentCoreGatewayRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GatewayRoleArn'
+
+  GatewayId:
+    Description: AgentCore Gateway ID
+    Value: !Ref MCPGateway
+
+  GatewayUrl:
+    Description: AgentCore Gateway URL (use this in Claude Web)
+    Value: !GetAtt MCPGateway.GatewayUrl
+
+  GatewayArn:
+    Description: AgentCore Gateway ARN
+    Value: !GetAtt MCPGateway.GatewayArn
+
+  TargetId:
+    Description: Gateway Target ID
+    Value: !Ref MCPGatewayTarget
+
+  UserPoolId:
+    Description: Cognito User Pool ID (from main stack)
+    Value: !ImportValue
+      Fn::Sub: '${MainStackName}-UserPoolId'
+
+  UserPoolDomain:
+    Description: Cognito User Pool Domain (from main stack)
+    Value: !ImportValue
+      Fn::Sub: '${MainStackName}-UserPoolDomain'
+
+  LambdaArn:
+    Description: AgentCore Lambda ARN (from main stack)
+    Value: !ImportValue
+      Fn::Sub: '${MainStackName}-AgentCoreFunctionArn'

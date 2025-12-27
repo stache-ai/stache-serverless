@@ -13,6 +13,11 @@ from .shared import (
     do_list_namespaces,
     do_list_documents,
     do_get_document,
+    do_delete_document,
+    do_create_namespace,
+    do_get_namespace,
+    do_update_namespace,
+    do_delete_namespace,
 )
 
 
@@ -177,6 +182,59 @@ def _handle_agentcore_tool(custom: dict, params: dict) -> dict:
             return do_get_document(
                 doc_id=doc_id,
                 namespace=namespace or 'default',
+                request_id=request_id
+            )
+
+        elif tool_name == 'delete_document':
+            doc_id = _validate_string(params.get('doc_id'), 'doc_id', required=True, max_length=200)
+            namespace = _validate_string(params.get('namespace', 'default'), 'namespace', required=False, max_length=100)
+            return do_delete_document(
+                doc_id=doc_id,
+                namespace=namespace or 'default',
+                request_id=request_id
+            )
+
+        elif tool_name == 'create_namespace':
+            ns_id = _validate_string(params.get('id'), 'id', required=True, max_length=200)
+            name = _validate_string(params.get('name'), 'name', required=True, max_length=200)
+            description = _validate_string(params.get('description', ''), 'description', required=False, max_length=1000)
+            return do_create_namespace(
+                id=ns_id,
+                name=name,
+                description=description or '',
+                parent_id=params.get('parent_id'),
+                metadata=params.get('metadata'),
+                filter_keys=params.get('filter_keys'),
+                request_id=request_id
+            )
+
+        elif tool_name == 'get_namespace':
+            ns_id = _validate_string(params.get('id'), 'id', required=True, max_length=200)
+            return do_get_namespace(
+                id=ns_id,
+                request_id=request_id
+            )
+
+        elif tool_name == 'update_namespace':
+            ns_id = _validate_string(params.get('id'), 'id', required=True, max_length=200)
+            name = _validate_string(params.get('name'), 'name', required=False, max_length=200)
+            description = _validate_string(params.get('description'), 'description', required=False, max_length=1000)
+            return do_update_namespace(
+                id=ns_id,
+                name=name,
+                description=description,
+                metadata=params.get('metadata'),
+                request_id=request_id
+            )
+
+        elif tool_name == 'delete_namespace':
+            ns_id = _validate_string(params.get('id'), 'id', required=True, max_length=200)
+            cascade = params.get('cascade', False)
+            if not isinstance(cascade, bool):
+                cascade = False
+            return do_delete_namespace(
+                id=ns_id,
+                cascade=cascade,
                 request_id=request_id
             )
 

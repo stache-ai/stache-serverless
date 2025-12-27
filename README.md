@@ -178,9 +178,9 @@ After deployment, add a CNAME record pointing your domain to the CloudFront dist
 
 Or use the **Create Cognito User** GitHub workflow.
 
-## AgentCore Gateway (Claude Desktop MCP)
+## AgentCore Gateway (Claude MCP)
 
-AgentCore Gateway enables Claude Desktop to access Stache via MCP (Model Context Protocol).
+AgentCore Gateway enables Claude to access Stache via MCP (Model Context Protocol). This works with Claude Web using OAuth auto-authentication.
 
 ### Setup
 
@@ -192,29 +192,33 @@ AgentCore Gateway enables Claude Desktop to access Stache via MCP (Model Context
 ./scripts/setup-agentcore.sh --prefix myapp
 ```
 
-This creates:
-1. **IAM Role** - Allows Bedrock to invoke the Lambda function
-2. **AgentCore Gateway** - MCP gateway with Cognito JWT authentication
-3. **Lambda Target** - Connects the gateway to the Stache Lambda with tool schema
+This deploys a separate CloudFormation stack (`{prefix}-agentcore`) containing:
+1. **MCP Resource Server** - Cognito resource server with custom scopes
+2. **MCP OAuth Client** - Cognito app client configured for Claude's OAuth flow
+3. **IAM Role** - Allows Bedrock to invoke the Lambda function
+4. **Lambda Permission** - Allows Bedrock gateway to invoke Lambda
+5. **AgentCore Gateway** - MCP gateway with Cognito OAuth authentication
+6. **Gateway Target** - Lambda target with tool schema
 
 Configuration is saved to `.agentcore-config.json`.
 
-### Claude Desktop Configuration
+### Claude Web Configuration
 
-Add to `~/.config/claude/claude_desktop_config.json`:
+To use Stache with Claude Web:
 
-```json
-{
-  "mcpServers": {
-    "stache": {
-      "url": "<gateway_url_from_setup>",
-      "headers": {
-        "Authorization": "Bearer <cognito_jwt_token>"
-      }
-    }
-  }
-}
-```
+1. Run `./scripts/setup-agentcore.sh` to get the credentials
+2. Go to [Claude Settings > MCP](https://claude.ai/settings/mcp)
+3. Click **Add MCP Server**
+4. Enter the values shown in the setup script output:
+   - **Name**: Stache (or any name you prefer)
+   - **URL**: The gateway URL (e.g., `https://stache-mcp-gateway-xxxxx.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp`)
+   - **Client ID**: The MCP client ID from setup
+   - **Client Secret**: The MCP client secret from setup
+5. Click **Connect**
+6. Claude will redirect to Cognito login - enter your username and password
+7. After authentication, you're connected!
+
+The credentials are also saved to `.agentcore-config.json` for reference.
 
 ### Available MCP Tools
 
@@ -225,47 +229,51 @@ Add to `~/.config/claude/claude_desktop_config.json`:
 | `list_namespaces` | List all namespaces |
 | `list_documents` | List documents (with pagination) |
 | `get_document` | Get document metadata by ID |
+| `create_namespace` | Create a new namespace |
+| `get_namespace` | Get namespace details |
+| `update_namespace` | Update namespace name/description |
+| `delete_namespace` | Delete a namespace |
 
-### Get OAuth Token for MCP
+### How OAuth Works
+
+The AgentCore gateway is configured with:
+- **CUSTOM_JWT authorizer** pointing to Cognito's OIDC discovery URL
+- **MCP OAuth client** with `https://claude.ai/api/mcp/auth_callback` as the callback URL
+- **Custom scopes**: `{prefix}-mcp/read` and `{prefix}-mcp/write`
+
+When you connect Claude to the gateway:
+1. Claude uses the client ID and secret you provided to initiate OAuth
+2. You're redirected to Cognito's hosted UI for login
+3. After login, Cognito redirects back to Claude with an authorization code
+4. Claude exchanges the code for access tokens
+5. Tokens are used for all subsequent MCP requests
+
+### Troubleshooting
+
+**"Invalid redirect_uri" error**
+
+The Cognito MCP client must have `https://claude.ai/api/mcp/auth_callback` in its callback URLs. This is configured automatically by the agentcore template. If you're getting this error, redeploy the agentcore stack:
 
 ```bash
-# Get stack outputs
-STACK_NAME="stache-serverless"
-
-CLIENT_ID=$(aws cloudformation describe-stacks \
-  --stack-name $STACK_NAME \
-  --query 'Stacks[0].Outputs[?OutputKey==`UserPoolClientId`].OutputValue' \
-  --output text)
-
-# Authenticate and get token
-TOKEN=$(aws cognito-idp initiate-auth \
-  --auth-flow USER_PASSWORD_AUTH \
-  --client-id $CLIENT_ID \
-  --auth-parameters USERNAME=user@example.com,PASSWORD=YourPassword! \
-  --query 'AuthenticationResult.IdToken' \
-  --output text)
-
-echo "Token: $TOKEN"
+./scripts/setup-agentcore.sh
 ```
 
-### Get JWT Token
+**"Access denied" after login**
+
+Ensure your Cognito user exists and the password is correct. Create a user if needed:
 
 ```bash
-# Get stack outputs
-STACK_NAME="stache-serverless"  # or "${prefix}-serverless"
+./scripts/create-user.sh user@example.com
+```
 
-CLIENT_ID=$(aws cloudformation describe-stacks \
-  --stack-name $STACK_NAME \
-  --query 'Stacks[0].Outputs[?OutputKey==`UserPoolClientId`].OutputValue' \
-  --output text)
+**Gateway not responding**
 
-# Authenticate
-aws cognito-idp initiate-auth \
-  --auth-flow USER_PASSWORD_AUTH \
-  --client-id $CLIENT_ID \
-  --auth-parameters USERNAME=user@example.com,PASSWORD=YourPassword123! \
-  --query 'AuthenticationResult.IdToken' \
-  --output text
+Check the gateway status:
+
+```bash
+aws bedrock-agentcore-control get-gateway \
+  --gateway-identifier $(jq -r .gateway_id .agentcore-config.json) \
+  --query 'status'
 ```
 
 ## What Gets Created
@@ -274,15 +282,16 @@ Resources are named with the prefix (default: `stache`):
 
 | Resource | Name Pattern |
 |----------|--------------|
-| CloudFormation Stack | `{prefix}-serverless` |
+| CloudFormation Stack (main) | `{prefix}-serverless` |
+| CloudFormation Stack (agentcore) | `{prefix}-agentcore` |
 | Lambda Functions | `{prefix}-api`, `{prefix}-agentcore` |
 | S3 Buckets | `{prefix}-vectors-{account}`, `{prefix}-frontend-{account}` |
 | DynamoDB Tables | `{prefix}-namespaces`, `{prefix}-documents` |
 | CloudFront Distribution | Auto-generated or custom domain |
 | Cognito User Pool | `{prefix}-serverless-users` |
+| Cognito MCP Client | `{prefix}-mcp-client` |
 | SQS Dead Letter Queue | `{prefix}-lambda-dlq` |
 | AgentCore Gateway | `{prefix}-mcp-gateway` |
-| AgentCore IAM Role Stack | `{prefix}-agentcore-role` |
 
 ## Multiple Deployments
 

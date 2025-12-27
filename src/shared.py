@@ -12,6 +12,11 @@ from stache_ai.core.operations import (
     do_list_namespaces,
     do_list_documents,
     do_get_document,
+    do_delete_document,
+    do_create_namespace,
+    do_get_namespace,
+    do_update_namespace,
+    do_delete_namespace,
 )
 
 __all__ = [
@@ -21,4 +26,9 @@ __all__ = [
     'do_list_namespaces',
     'do_list_documents',
     'do_get_document',
+    'do_delete_document',
+    'do_create_namespace',
+    'do_get_namespace',
+    'do_update_namespace',
+    'do_delete_namespace',
 ]
