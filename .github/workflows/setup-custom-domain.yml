@@ -1,0 +1,39 @@
+name: Setup Custom Domain
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_prefix:
+        description: 'Resource prefix (default: stache)'
+        required: false
+        type: string
+        default: 'stache'
+      domain:
+        description: 'Custom domain (e.g., stache.example.com)'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  setup-domain:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run setup script
+        run: ./scripts/setup-custom-domain.sh --prefix "${{ inputs.resource_prefix }}" "${{ inputs.domain }}"

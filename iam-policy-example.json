@@ -1,0 +1,350 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CloudFormationAccess",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:CreateStack",
+        "cloudformation:UpdateStack",
+        "cloudformation:DeleteStack",
+        "cloudformation:DescribeStacks",
+        "cloudformation:DescribeStackEvents",
+        "cloudformation:DescribeStackResources",
+        "cloudformation:GetTemplate",
+        "cloudformation:ValidateTemplate",
+        "cloudformation:CreateChangeSet",
+        "cloudformation:DescribeChangeSet",
+        "cloudformation:ExecuteChangeSet",
+        "cloudformation:DeleteChangeSet",
+        "cloudformation:ListStackResources"
+      ],
+      "Resource": [
+        "arn:aws:cloudformation:*:*:stack/*-serverless/*",
+        "arn:aws:cloudformation:*:*:stack/*-certificate/*"
+      ]
+    },
+    {
+      "Sid": "S3ArtifactsBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:ListBucket",
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:GetBucketLocation",
+        "s3:GetBucketVersioning",
+        "s3:PutBucketVersioning"
+      ],
+      "Resource": [
+        "arn:aws:s3:::aws-sam-cli-managed-default-*",
+        "arn:aws:s3:::aws-sam-cli-managed-default-*/*"
+      ]
+    },
+    {
+      "Sid": "S3VectorsBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:DeleteBucket",
+        "s3:ListBucket",
+        "s3:GetBucketPolicy",
+        "s3:PutBucketPolicy",
+        "s3:DeleteBucketPolicy",
+        "s3:GetBucketVersioning",
+        "s3:PutBucketVersioning",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:PutBucketPublicAccessBlock"
+      ],
+      "Resource": [
+        "arn:aws:s3:::*-vectors-*"
+      ]
+    },
+    {
+      "Sid": "S3FrontendBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:DeleteBucket",
+        "s3:ListBucket",
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:GetBucketPolicy",
+        "s3:PutBucketPolicy",
+        "s3:DeleteBucketPolicy",
+        "s3:GetBucketWebsite",
+        "s3:PutBucketWebsite",
+        "s3:DeleteBucketWebsite",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:PutBucketPublicAccessBlock",
+        "s3:GetBucketCORS",
+        "s3:PutBucketCORS"
+      ],
+      "Resource": [
+        "arn:aws:s3:::*-frontend-*",
+        "arn:aws:s3:::*-frontend-*/*"
+      ]
+    },
+    {
+      "Sid": "LambdaFunctions",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateFunction",
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration",
+        "lambda:DeleteFunction",
+        "lambda:GetFunction",
+        "lambda:GetFunctionConfiguration",
+        "lambda:ListVersionsByFunction",
+        "lambda:PublishVersion",
+        "lambda:CreateAlias",
+        "lambda:UpdateAlias",
+        "lambda:DeleteAlias",
+        "lambda:GetAlias",
+        "lambda:AddPermission",
+        "lambda:RemovePermission",
+        "lambda:GetPolicy",
+        "lambda:TagResource",
+        "lambda:UntagResource"
+      ],
+      "Resource": [
+        "arn:aws:lambda:*:*:function:*-api",
+        "arn:aws:lambda:*:*:function:*-agentcore"
+      ]
+    },
+    {
+      "Sid": "LambdaLayers",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:PublishLayerVersion",
+        "lambda:GetLayerVersion",
+        "lambda:DeleteLayerVersion"
+      ],
+      "Resource": [
+        "arn:aws:lambda:*:*:layer:*"
+      ]
+    },
+    {
+      "Sid": "APIGateway",
+      "Effect": "Allow",
+      "Action": [
+        "apigateway:GET",
+        "apigateway:POST",
+        "apigateway:PUT",
+        "apigateway:DELETE",
+        "apigateway:PATCH"
+      ],
+      "Resource": [
+        "arn:aws:apigateway:*::/restapis",
+        "arn:aws:apigateway:*::/restapis/*"
+      ]
+    },
+    {
+      "Sid": "DynamoDB",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:CreateTable",
+        "dynamodb:UpdateTable",
+        "dynamodb:DeleteTable",
+        "dynamodb:DescribeTable",
+        "dynamodb:DescribeTimeToLive",
+        "dynamodb:UpdateTimeToLive",
+        "dynamodb:TagResource",
+        "dynamodb:UntagResource",
+        "dynamodb:ListTagsOfResource"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:*:*:table/*-namespaces",
+        "arn:aws:dynamodb:*:*:table/*-documents"
+      ]
+    },
+    {
+      "Sid": "Cognito",
+      "Effect": "Allow",
+      "Action": [
+        "cognito-idp:CreateUserPool",
+        "cognito-idp:UpdateUserPool",
+        "cognito-idp:DeleteUserPool",
+        "cognito-idp:DescribeUserPool",
+        "cognito-idp:CreateUserPoolClient",
+        "cognito-idp:UpdateUserPoolClient",
+        "cognito-idp:DeleteUserPoolClient",
+        "cognito-idp:DescribeUserPoolClient",
+        "cognito-idp:CreateUserPoolDomain",
+        "cognito-idp:DeleteUserPoolDomain",
+        "cognito-idp:DescribeUserPoolDomain",
+        "cognito-idp:AdminCreateUser",
+        "cognito-idp:AdminGetUser",
+        "cognito-idp:AdminSetUserPassword",
+        "cognito-idp:ListUsers"
+      ],
+      "Resource": [
+        "arn:aws:cognito-idp:*:*:userpool/*"
+      ]
+    },
+    {
+      "Sid": "IAMRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:PassRole",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:GetRolePolicy",
+        "iam:TagRole",
+        "iam:UntagRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:role/*-serverless-*"
+      ]
+    },
+    {
+      "Sid": "IAMPolicyManagement",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreatePolicy",
+        "iam:DeletePolicy",
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
+        "iam:ListPolicyVersions"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:policy/*-serverless-*"
+      ]
+    },
+    {
+      "Sid": "S3VectorsService",
+      "Effect": "Allow",
+      "Action": [
+        "s3vectors:*"
+      ],
+      "Resource": [
+        "arn:aws:s3vectors:*:*:index/*"
+      ]
+    },
+    {
+      "Sid": "ACMCertificates",
+      "Effect": "Allow",
+      "Action": [
+        "acm:RequestCertificate",
+        "acm:DescribeCertificate",
+        "acm:DeleteCertificate",
+        "acm:ListCertificates",
+        "acm:GetCertificate",
+        "acm:AddTagsToCertificate",
+        "acm:RemoveTagsFromCertificate",
+        "acm:ListTagsForCertificate"
+      ],
+      "Resource": [
+        "*"
+      ]
+    },
+    {
+      "Sid": "CloudFront",
+      "Effect": "Allow",
+      "Action": [
+        "cloudfront:CreateDistribution",
+        "cloudfront:UpdateDistribution",
+        "cloudfront:DeleteDistribution",
+        "cloudfront:GetDistribution",
+        "cloudfront:GetDistributionConfig",
+        "cloudfront:ListDistributions",
+        "cloudfront:CreateInvalidation",
+        "cloudfront:GetInvalidation",
+        "cloudfront:ListInvalidations",
+        "cloudfront:TagResource",
+        "cloudfront:UntagResource",
+        "cloudfront:ListTagsForResource",
+        "cloudfront:CreateOriginAccessControl",
+        "cloudfront:UpdateOriginAccessControl",
+        "cloudfront:DeleteOriginAccessControl",
+        "cloudfront:GetOriginAccessControl",
+        "cloudfront:ListOriginAccessControls"
+      ],
+      "Resource": [
+        "*"
+      ]
+    },
+    {
+      "Sid": "SQSDeadLetterQueue",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:CreateQueue",
+        "sqs:DeleteQueue",
+        "sqs:GetQueueAttributes",
+        "sqs:SetQueueAttributes",
+        "sqs:GetQueueUrl",
+        "sqs:TagQueue",
+        "sqs:UntagQueue",
+        "sqs:ListQueueTags"
+      ],
+      "Resource": [
+        "arn:aws:sqs:*:*:*-lambda-dlq"
+      ]
+    },
+    {
+      "Sid": "BedrockAgentCore",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore-control:CreateGateway",
+        "bedrock-agentcore-control:UpdateGateway",
+        "bedrock-agentcore-control:DeleteGateway",
+        "bedrock-agentcore-control:GetGateway",
+        "bedrock-agentcore-control:ListGateways",
+        "bedrock-agentcore-control:CreateTarget",
+        "bedrock-agentcore-control:UpdateTarget",
+        "bedrock-agentcore-control:DeleteTarget",
+        "bedrock-agentcore-control:GetTarget",
+        "bedrock-agentcore-control:ListTargets"
+      ],
+      "Resource": [
+        "*"
+      ]
+    },
+    {
+      "Sid": "BedrockAgentCoreIAMRole",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:PassRole",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:GetRolePolicy",
+        "iam:TagRole",
+        "iam:UntagRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:role/*-agentcore-gateway-role"
+      ]
+    },
+    {
+      "Sid": "CloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:DeleteLogGroup",
+        "logs:DescribeLogGroups",
+        "logs:CreateLogStream",
+        "logs:DeleteLogStream",
+        "logs:PutLogEvents",
+        "logs:GetLogEvents",
+        "logs:FilterLogEvents",
+        "logs:PutRetentionPolicy"
+      ],
+      "Resource": [
+        "arn:aws:logs:*:*:log-group:/aws/lambda/*-api:*",
+        "arn:aws:logs:*:*:log-group:/aws/lambda/*-agentcore:*"
+      ]
+    }
+  ]
+}

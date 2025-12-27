@@ -1,0 +1,599 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Stache AI - Serverless deployment for AWS Lambda
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Description: Prefix for all resource names (allows multiple deployments per account)
+    Default: "stache"
+    AllowedPattern: "^[a-z][a-z0-9-]*$"
+    ConstraintDescription: Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens
+  AppDomain:
+    Type: String
+    Description: Custom domain for the application (optional)
+    Default: ""
+  CertificateArn:
+    Type: String
+    Description: ACM certificate ARN for custom domain (required if AppDomain is set)
+    Default: ""
+
+Conditions:
+  UseCustomDomain: !Not [!Equals [!Ref AppDomain, ""]]
+
+Globals:
+  Function:
+    Timeout: 300
+    MemorySize: 512
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        # Provider Configuration
+        LLM_PROVIDER: bedrock
+        EMBEDDING_PROVIDER: bedrock
+        VECTORDB_PROVIDER: s3vectors
+        NAMESPACE_PROVIDER: dynamodb
+        DOCUMENT_INDEX_PROVIDER: dynamodb
+        RERANKER_PROVIDER: simple
+
+        # AWS Provider Settings (AWS_REGION is automatically set by Lambda)
+        BEDROCK_LLM_MODEL: anthropic.claude-3-5-sonnet-20241022-v2:0
+        BEDROCK_EMBEDDING_MODEL: cohere.embed-english-v3
+        S3VECTORS_BUCKET: !Sub '${ResourcePrefix}-vectors-${AWS::AccountId}'
+        S3VECTORS_INDEX: !Sub '${ResourcePrefix}-vectors'
+        S3VECTORS_DOCUMENTS_INDEX: !Sub '${ResourcePrefix}-documents'
+        S3VECTORS_SUMMARIES_INDEX: !Sub '${ResourcePrefix}-summaries'
+        S3VECTORS_INSIGHTS_INDEX: !Sub '${ResourcePrefix}-insights'
+        DYNAMODB_NAMESPACE_TABLE: !Ref NamespaceTable
+        DYNAMODB_DOCUMENTS_TABLE: !Ref DocumentsTable
+
+        # General Settings
+        LOG_LEVEL: info
+        EMBEDDING_DIMENSION: "1024"
+        CHUNK_SIZE: "1500"
+        CHUNK_OVERLAP: "150"
+
+        # CORS - allow CloudFront, custom domain, and localhost
+        CORS_ORIGINS: !If
+          - UseCustomDomain
+          - !Sub 'https://${AppDomain},https://${CloudFrontDistribution.DomainName},http://localhost:3000,http://localhost:8000'
+          - !Sub 'https://${CloudFrontDistribution.DomainName},http://localhost:3000,http://localhost:8000'
+
+Resources:
+  # Lambda Layer with Stache packages
+  StacheLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub '${ResourcePrefix}-dependencies'
+      Description: Stache AI packages for Lambda
+      ContentUri: layer/
+      CompatibleRuntimes:
+        - python3.12
+      RetentionPolicy: Delete
+
+  # S3 Vectors bucket for vector storage (NOT an S3 bucket - different service)
+  S3VectorsBucket:
+    Type: AWS::S3Vectors::VectorBucket
+    Properties:
+      VectorBucketName: !Sub '${ResourcePrefix}-vectors-${AWS::AccountId}'
+
+  # S3 Vectors index for document chunks
+  VectorsIndex:
+    Type: AWS::S3Vectors::Index
+    Properties:
+      VectorBucketArn: !GetAtt S3VectorsBucket.VectorBucketArn
+      IndexName: !Sub '${ResourcePrefix}-vectors'
+      DataType: float32
+      Dimension: 1024
+      DistanceMetric: cosine
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+          - text
+
+  # S3 Vectors index for documents
+  DocumentsVectorIndex:
+    Type: AWS::S3Vectors::Index
+    Properties:
+      VectorBucketArn: !GetAtt S3VectorsBucket.VectorBucketArn
+      IndexName: !Sub '${ResourcePrefix}-documents'
+      DataType: float32
+      Dimension: 1024
+      DistanceMetric: cosine
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+          - text
+
+  # S3 Vectors index for summaries
+  SummariesVectorIndex:
+    Type: AWS::S3Vectors::Index
+    Properties:
+      VectorBucketArn: !GetAtt S3VectorsBucket.VectorBucketArn
+      IndexName: !Sub '${ResourcePrefix}-summaries'
+      DataType: float32
+      Dimension: 1024
+      DistanceMetric: cosine
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+          - text
+
+  # S3 Vectors index for insights
+  InsightsVectorIndex:
+    Type: AWS::S3Vectors::Index
+    Properties:
+      VectorBucketArn: !GetAtt S3VectorsBucket.VectorBucketArn
+      IndexName: !Sub '${ResourcePrefix}-insights'
+      DataType: float32
+      Dimension: 1024
+      DistanceMetric: cosine
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+          - text
+
+  # S3 Bucket for frontend static files
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-frontend-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # S3 Bucket Policy allowing CloudFront access
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # CloudFront Origin Access Control for S3
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ResourcePrefix}-oac-${AWS::AccountId}'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # CloudFront Distribution for frontend
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        HttpVersion: http2and3
+        # Custom domain alias (only if configured)
+        Aliases: !If
+          - UseCustomDomain
+          - - !Ref AppDomain
+          - !Ref AWS::NoValue
+        # SSL certificate
+        ViewerCertificate: !If
+          - UseCustomDomain
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # Managed-CachingOptimized
+          Compress: true
+        # SPA routing - return index.html for 403/404
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  # DynamoDB table for namespace registry
+  NamespaceTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ResourcePrefix}-namespaces'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: parent_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: parent_id-index
+          KeySchema:
+            - AttributeName: parent_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  # DynamoDB table for document index
+  # Schema: PK (DOC#{namespace}#{doc_id}) + SK (METADATA)
+  # GSI1: namespace queries (GSI1PK=NAMESPACE#{ns}, GSI1SK=CREATED#{ts})
+  # GSI2: filename lookups (GSI2PK=FILENAME#{ns}#{file}, GSI2SK=CREATED#{ts})
+  DocumentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ResourcePrefix}-documents'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+        - AttributeName: GSI2PK
+          AttributeType: S
+        - AttributeName: GSI2SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: GSI2
+          KeySchema:
+            - AttributeName: GSI2PK
+              KeyType: HASH
+            - AttributeName: GSI2SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # Cognito User Pool for authentication
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-users'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+
+  # Cognito User Pool Client
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: CloudFrontDistribution
+    Properties:
+      ClientName: !Sub '${AWS::StackName}-client'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+      AllowedOAuthFlowsUserPoolClient: true
+      # Callback URLs - CloudFront + custom domain + localhost
+      CallbackURLs: !If
+        - UseCustomDomain
+        - - !Sub 'https://${AppDomain}'
+          - !Sub 'https://${AppDomain}/callback'
+          - !Sub 'https://${CloudFrontDistribution.DomainName}'
+          - !Sub 'https://${CloudFrontDistribution.DomainName}/callback'
+          - 'http://localhost:3000'
+          - 'http://localhost:3000/callback'
+        - - !Sub 'https://${CloudFrontDistribution.DomainName}'
+          - !Sub 'https://${CloudFrontDistribution.DomainName}/callback'
+          - 'http://localhost:3000'
+          - 'http://localhost:3000/callback'
+      LogoutURLs: !If
+        - UseCustomDomain
+        - - !Sub 'https://${AppDomain}'
+          - !Sub 'https://${CloudFrontDistribution.DomainName}'
+          - 'http://localhost:3000'
+        - - !Sub 'https://${CloudFrontDistribution.DomainName}'
+          - 'http://localhost:3000'
+      SupportedIdentityProviders:
+        - COGNITO
+
+  # Cognito User Pool Domain
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub '${AWS::StackName}-${AWS::AccountId}'
+      UserPoolId: !Ref UserPool
+
+  # Lambda function for HTTP API (API Gateway + Cognito)
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-api'
+      CodeUri: ./
+      Handler: src.api_handler.handler
+      Layers:
+        - !Ref StacheLayer
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NamespaceTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DocumentsTable
+        - Statement:
+            # Bedrock access - wildcard resource required for cross-region inference profiles
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:Converse
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - s3vectors:GetVectorBucket
+              Resource:
+                - !GetAtt S3VectorsBucket.VectorBucketArn
+            - Effect: Allow
+              Action:
+                - s3vectors:CreateIndex
+                - s3vectors:GetIndex
+                - s3vectors:ListIndexes
+                - s3vectors:PutVectors
+                - s3vectors:QueryVectors
+                - s3vectors:ListVectors
+                - s3vectors:DeleteVectors
+                - s3vectors:GetVectors
+              Resource:
+                - !Sub '${S3VectorsBucket.VectorBucketArn}/index/*'
+      Events:
+        # API Gateway HTTP events
+        HealthCheck:
+          Type: Api
+          Properties:
+            Path: /health
+            Method: GET
+            RestApiId: !Ref StacheApi
+            Auth:
+              Authorizer: NONE
+        ApiRoot:
+          Type: Api
+          Properties:
+            Path: /
+            Method: ANY
+            RestApiId: !Ref StacheApi
+        ApiProxy:
+          Type: Api
+          Properties:
+            Path: /{proxy+}
+            Method: ANY
+            RestApiId: !Ref StacheApi
+
+  # Lambda function for AgentCore Gateway (Claude Desktop MCP)
+  AgentCoreFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-agentcore'
+      CodeUri: ./
+      Handler: src.agentcore_handler.handler
+      Layers:
+        - !Ref StacheLayer
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NamespaceTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DocumentsTable
+        - Statement:
+            # Bedrock access - wildcard resource required for cross-region inference profiles
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:Converse
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - s3vectors:GetVectorBucket
+              Resource:
+                - !GetAtt S3VectorsBucket.VectorBucketArn
+            - Effect: Allow
+              Action:
+                - s3vectors:CreateIndex
+                - s3vectors:GetIndex
+                - s3vectors:ListIndexes
+                - s3vectors:PutVectors
+                - s3vectors:QueryVectors
+                - s3vectors:ListVectors
+                - s3vectors:DeleteVectors
+                - s3vectors:GetVectors
+              Resource:
+                - !Sub '${S3VectorsBucket.VectorBucketArn}/index/*'
+
+  # Dead Letter Queue for failed Lambda invocations
+  LambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ResourcePrefix}-lambda-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeout: 300
+
+  # CloudWatch Alarm for API Function Errors
+  ApiErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-api-errors'
+      AlarmDescription: Alert when API Lambda has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiFunction
+
+  # CloudWatch Alarm for AgentCore Function Errors
+  AgentCoreErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-agentcore-errors'
+      AlarmDescription: Alert when AgentCore Lambda has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AgentCoreFunction
+
+  # API Gateway with Cognito Authorizer
+  StacheApi:
+    Type: AWS::Serverless::Api
+    DependsOn: CloudFrontDistribution
+    Properties:
+      StageName: Prod
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+        AllowCredentials: true
+        # CORS origins: CloudFront + custom domain (if set) + localhost
+        AllowOrigin: !If
+          - UseCustomDomain
+          - !Sub "'https://${AppDomain}'"
+          - !Sub "'https://${CloudFrontDistribution.DomainName}'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+        AddDefaultAuthorizerToCorsPreflight: false
+
+Outputs:
+  StacheLayerArn:
+    Description: Stache dependencies Lambda layer ARN
+    Value: !Ref StacheLayer
+
+  ApiUrl:
+    Description: API Gateway endpoint URL (HTTP API with Cognito auth)
+    Value: !Sub 'https://${StacheApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/'
+
+  ApiFunction:
+    Description: HTTP API Lambda Function ARN
+    Value: !GetAtt ApiFunction.Arn
+
+  AgentCoreFunction:
+    Description: AgentCore Lambda Function ARN (for Claude Desktop MCP)
+    Value: !GetAtt AgentCoreFunction.Arn
+
+  S3VectorsBucket:
+    Description: S3 Vectors bucket name
+    Value: !Ref S3VectorsBucket
+
+  NamespaceTable:
+    Description: DynamoDB namespace table
+    Value: !Ref NamespaceTable
+
+  DocumentsTable:
+    Description: DynamoDB documents table
+    Value: !Ref DocumentsTable
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+
+  UserPoolDomain:
+    Description: Cognito User Pool Domain
+    Value: !Sub '${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+
+  # AgentCore outputs
+  AgentCoreFunctionArn:
+    Description: AgentCore Lambda function ARN (for MCP gateway)
+    Value: !GetAtt AgentCoreFunction.Arn
+
+  AgentCoreFunctionName:
+    Description: AgentCore Lambda function name
+    Value: !Ref AgentCoreFunction
+
+  # Frontend outputs
+  FrontendBucketName:
+    Description: S3 bucket for frontend files
+    Value: !Ref FrontendBucket
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref CloudFrontDistribution
+
+  CloudFrontDomain:
+    Description: CloudFront distribution domain
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  FrontendUrl:
+    Description: Frontend URL (custom domain or CloudFront)
+    Value: !If
+      - UseCustomDomain
+      - !Sub 'https://${AppDomain}'
+      - !Sub 'https://${CloudFrontDistribution.DomainName}'
+
+  LoginUrl:
+    Description: Cognito login URL
+    Value: !If
+      - UseCustomDomain
+      - !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${UserPoolClient}&response_type=token&scope=email+openid+profile&redirect_uri=https://${AppDomain}'
+      - !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${UserPoolClient}&response_type=token&scope=email+openid+profile&redirect_uri=https://${CloudFrontDistribution.DomainName}'

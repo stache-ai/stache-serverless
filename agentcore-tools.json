@@ -1,0 +1,103 @@
+{
+  "tools": [
+    {
+      "name": "search",
+      "description": "Search your knowledge base for relevant information. Use when the user asks about their saved documents, notes, or uploaded files. Returns relevant text passages ranked by relevance.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Natural language search query"
+          },
+          "namespace": {
+            "type": "string",
+            "description": "Optional namespace to search within"
+          },
+          "top_k": {
+            "type": "integer",
+            "description": "Number of results to return (max 50, default: 20)"
+          },
+          "rerank": {
+            "type": "boolean",
+            "description": "Rerank results for relevance (default: true)"
+          },
+          "filter": {
+            "type": "object",
+            "description": "Optional metadata filter (e.g., {\"source\": \"meeting notes\"})"
+          }
+        },
+        "required": ["query"]
+      }
+    },
+    {
+      "name": "ingest_text",
+      "description": "Add text content to the knowledge base. Use to save notes, documentation, or any text the user wants to remember. Content is automatically chunked and indexed for later retrieval.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Text content to ingest (max 100KB)"
+          },
+          "metadata": {
+            "type": "object",
+            "description": "Optional metadata to attach to the ingested content"
+          },
+          "namespace": {
+            "type": "string",
+            "description": "Optional namespace to organize content (default: 'default')"
+          }
+        },
+        "required": ["text"]
+      }
+    },
+    {
+      "name": "list_namespaces",
+      "description": "List all namespaces in the knowledge base. Use to discover what knowledge domains are available before searching. Returns namespace details including filter_keys - the valid metadata keys you can use to filter searches in each namespace.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "list_documents",
+      "description": "List documents in the knowledge base. Use to see what content has been indexed. Supports pagination via next_key for large result sets.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "namespace": {
+            "type": "string",
+            "description": "Filter documents by namespace"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum documents to return (max 100, default: 100)"
+          },
+          "next_key": {
+            "type": "string",
+            "description": "Pagination token from previous response for fetching next page"
+          }
+        }
+      }
+    },
+    {
+      "name": "get_document",
+      "description": "Get metadata for a specific document by ID. Use to retrieve details about a document found in search results or document listing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "doc_id": {
+            "type": "string",
+            "description": "Document UUID"
+          },
+          "namespace": {
+            "type": "string",
+            "description": "Namespace containing the document (default: 'default')"
+          }
+        },
+        "required": ["doc_id"]
+      }
+    }
+  ]
+}

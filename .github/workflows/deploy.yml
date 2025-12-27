@@ -1,0 +1,324 @@
+name: Deploy to AWS
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_prefix:
+        description: 'Resource prefix (default: stache, allows multiple deployments)'
+        required: false
+        type: string
+        default: 'stache'
+      app_domain:
+        description: 'Custom domain (optional, e.g., stache.example.com)'
+        required: false
+        type: string
+      certificate_arn:
+        description: 'ACM certificate ARN (optional, auto-detected from domain)'
+        required: false
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Method A: IAM Access Keys (if AWS_ACCESS_KEY_ID is set)
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          # Method B: OIDC (if AWS_ACCOUNT_ID is set - uncomment line below)
+          # role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-stache-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Checkout packages (stache repo)
+        uses: actions/checkout@v4
+        with:
+          repository: stache-ai/stache-ai
+          path: stache-packages
+          sparse-checkout: packages
+          fetch-depth: 1
+          token: ${{ secrets.STACHE_REPO_TOKEN || github.token }}
+
+      - name: Build Lambda layer
+        run: |
+          mkdir -p layer/python
+          pip install \
+            stache-packages/packages/stache-ai \
+            stache-packages/packages/stache-ai-bedrock \
+            stache-packages/packages/stache-ai-s3vectors \
+            stache-packages/packages/stache-ai-dynamodb \
+            mangum \
+            -t layer/python --quiet
+
+          # Clean up unnecessary files to reduce layer size (keep stache_ai*.dist-info for entry points)
+          find layer/python -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+          find layer/python -type d -name "*.dist-info" ! -name "stache_ai*.dist-info" -exec rm -rf {} + 2>/dev/null || true
+          find layer/python -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
+
+      - name: Build SAM application
+        run: sam build
+
+      - name: Set resource names
+        id: names
+        run: |
+          PREFIX="${{ inputs.resource_prefix }}"
+          echo "prefix=$PREFIX" >> $GITHUB_OUTPUT
+          echo "stack_name=${PREFIX}-serverless" >> $GITHUB_OUTPUT
+
+      - name: Get domain configuration
+        id: domain
+        run: |
+          STACK_NAME="${{ steps.names.outputs.stack_name }}"
+          DOMAIN="${{ inputs.app_domain }}"
+          CERT="${{ inputs.certificate_arn }}"
+
+          # If domain provided but no cert, look up certificate by domain name
+          if [ -n "$DOMAIN" ] && [ -z "$CERT" ]; then
+            echo "Looking for certificate for domain: $DOMAIN"
+
+            CERT=$(aws acm list-certificates \
+              --query "CertificateSummaryList[?DomainName=='$DOMAIN'].CertificateArn | [0]" \
+              --output text 2>/dev/null || echo "")
+
+            if [ -z "$CERT" ] || [ "$CERT" = "None" ]; then
+              echo "::error::No certificate found for domain: $DOMAIN"
+              echo "Create one with: ./scripts/setup-custom-domain.sh $DOMAIN"
+              exit 1
+            fi
+
+            # Verify certificate is validated
+            CERT_STATUS=$(aws acm describe-certificate \
+              --certificate-arn "$CERT" \
+              --query 'Certificate.Status' \
+              --output text 2>/dev/null || echo "")
+
+            if [ "$CERT_STATUS" != "ISSUED" ]; then
+              echo "::error::Certificate for $DOMAIN is not validated (status: $CERT_STATUS)"
+              echo "Check status with: ./scripts/check-certificate.sh"
+              exit 1
+            fi
+
+            echo "Found validated certificate for: $DOMAIN"
+          fi
+
+          # Fall back to existing stack parameters if no domain specified
+          if [ -z "$DOMAIN" ]; then
+            DOMAIN=$(aws cloudformation describe-stacks \
+              --stack-name "$STACK_NAME" \
+              --query 'Stacks[0].Parameters[?ParameterKey==`AppDomain`].ParameterValue' \
+              --output text 2>/dev/null || echo "")
+            CERT=$(aws cloudformation describe-stacks \
+              --stack-name "$STACK_NAME" \
+              --query 'Stacks[0].Parameters[?ParameterKey==`CertificateArn`].ParameterValue' \
+              --output text 2>/dev/null || echo "")
+          fi
+
+          echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
+          echo "cert=$CERT" >> $GITHUB_OUTPUT
+
+      - name: Deploy to AWS
+        run: |
+          STACK_NAME="${{ steps.names.outputs.stack_name }}"
+          PREFIX="${{ steps.names.outputs.prefix }}"
+          PARAMS="ResourcePrefix=$PREFIX"
+          DOMAIN="${{ steps.domain.outputs.domain }}"
+          CERT="${{ steps.domain.outputs.cert }}"
+
+          if [ -n "$DOMAIN" ] && [ "$DOMAIN" != "None" ]; then
+            PARAMS="$PARAMS AppDomain=$DOMAIN"
+          fi
+          if [ -n "$CERT" ] && [ "$CERT" != "None" ]; then
+            PARAMS="$PARAMS CertificateArn=$CERT"
+          fi
+
+          sam deploy \
+            --stack-name "$STACK_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --capabilities CAPABILITY_IAM \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --resolve-s3 \
+            --parameter-overrides $PARAMS
+
+      - name: Get stack outputs
+        id: outputs
+        run: |
+          STACK_NAME="${{ steps.names.outputs.stack_name }}"
+
+          USER_POOL_ID=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`UserPoolId`].OutputValue' \
+            --output text)
+          echo "user_pool_id=$USER_POOL_ID" >> $GITHUB_OUTPUT
+
+          USER_POOL_CLIENT_ID=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`UserPoolClientId`].OutputValue' \
+            --output text)
+          echo "user_pool_client_id=$USER_POOL_CLIENT_ID" >> $GITHUB_OUTPUT
+
+          API_URL=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`ApiUrl`].OutputValue' \
+            --output text)
+          echo "api_url=$API_URL" >> $GITHUB_OUTPUT
+
+          FRONTEND_BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`FrontendBucketName`].OutputValue' \
+            --output text)
+          echo "frontend_bucket=$FRONTEND_BUCKET" >> $GITHUB_OUTPUT
+
+          CLOUDFRONT_ID=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`CloudFrontDistributionId`].OutputValue' \
+            --output text)
+          echo "cloudfront_id=$CLOUDFRONT_ID" >> $GITHUB_OUTPUT
+
+          FRONTEND_URL=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`FrontendUrl`].OutputValue' \
+            --output text)
+          echo "frontend_url=$FRONTEND_URL" >> $GITHUB_OUTPUT
+
+          COGNITO_DOMAIN=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`UserPoolDomain`].OutputValue' \
+            --output text)
+          echo "cognito_domain=$COGNITO_DOMAIN" >> $GITHUB_OUTPUT
+
+          # Get custom domain if configured
+          APP_DOMAIN=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Parameters[?ParameterKey==`AppDomain`].ParameterValue' \
+            --output text 2>/dev/null || echo "")
+          echo "app_domain=$APP_DOMAIN" >> $GITHUB_OUTPUT
+
+          # Get CloudFront domain name for custom domain CNAME setup
+          CLOUDFRONT_DOMAIN=$(aws cloudfront get-distribution \
+            --id "$CLOUDFRONT_ID" \
+            --query 'Distribution.DomainName' \
+            --output text 2>/dev/null || echo "")
+          echo "cloudfront_domain=$CLOUDFRONT_DOMAIN" >> $GITHUB_OUTPUT
+
+      - name: Checkout frontend (stache repo)
+        uses: actions/checkout@v4
+        with:
+          repository: stache-ai/stache-ai
+          path: stache-frontend
+          sparse-checkout: frontend
+          fetch-depth: 1  # Shallow clone - only latest commit
+          # Uses GITHUB_TOKEN by default, or set STACHE_REPO_TOKEN secret for private repos
+          token: ${{ secrets.STACHE_REPO_TOKEN || github.token }}
+
+      - name: Build frontend
+        working-directory: stache-frontend/frontend
+        env:
+          # Pass Cognito config to frontend build
+          VITE_AUTH_PROVIDER: cognito
+          VITE_COGNITO_USER_POOL_ID: ${{ steps.outputs.outputs.user_pool_id }}
+          VITE_COGNITO_CLIENT_ID: ${{ steps.outputs.outputs.user_pool_client_id }}
+          VITE_COGNITO_DOMAIN: ${{ steps.outputs.outputs.cognito_domain }}
+          VITE_API_URL: ${{ steps.outputs.outputs.api_url }}
+        run: |
+          npm ci
+          npm run build
+
+      - name: Deploy frontend to S3
+        run: |
+          aws s3 sync stache-frontend/frontend/dist s3://${{ steps.outputs.outputs.frontend_bucket }}/ \
+            --delete \
+            --cache-control "max-age=31536000,public" \
+            --exclude "index.html" \
+            --exclude "*.json"
+
+          # Upload index.html and JSON with no-cache for immediate updates
+          aws s3 cp stache-frontend/frontend/dist/index.html s3://${{ steps.outputs.outputs.frontend_bucket }}/index.html \
+            --cache-control "no-cache,no-store,must-revalidate"
+
+          # Upload any JSON files (like config) with no-cache
+          find stache-frontend/frontend/dist -name "*.json" -exec aws s3 cp {} s3://${{ steps.outputs.outputs.frontend_bucket }}/ \
+            --cache-control "no-cache,no-store,must-revalidate" \;
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ steps.outputs.outputs.cloudfront_id }} \
+            --paths "/*"
+
+      - name: Deployment summary
+        run: |
+          echo "## Deployment Complete ✓" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Show the app URL (frontend URL from CloudFront or custom domain)
+          echo "### 🌐 Your App" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**${{ steps.outputs.outputs.frontend_url }}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Show custom domain setup instructions if domain is configured
+          APP_DOMAIN="${{ steps.outputs.outputs.app_domain }}"
+          CLOUDFRONT_DOMAIN="${{ steps.outputs.outputs.cloudfront_domain }}"
+          if [ -n "$APP_DOMAIN" ] && [ "$APP_DOMAIN" != "None" ] && [ -n "$CLOUDFRONT_DOMAIN" ]; then
+            echo "### 🔗 Custom Domain Setup" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Add this CNAME record to your DNS:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Type | Name | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|------|------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| CNAME | \`$APP_DOMAIN\` | \`$CLOUDFRONT_DOMAIN\` |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "### Stack Details" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource Prefix | \`${{ steps.names.outputs.prefix }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Stack Name | \`${{ steps.names.outputs.stack_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Region | \`${{ env.AWS_REGION }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend URL | ${{ steps.outputs.outputs.frontend_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| API Gateway | ${{ steps.outputs.outputs.api_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| CloudFront ID | \`${{ steps.outputs.outputs.cloudfront_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| CloudFront Domain | \`${{ steps.outputs.outputs.cloudfront_domain }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| S3 Bucket | \`${{ steps.outputs.outputs.frontend_bucket }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| User Pool ID | \`${{ steps.outputs.outputs.user_pool_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Client ID | \`${{ steps.outputs.outputs.user_pool_client_id }}\` |" >> $GITHUB_STEP_SUMMARY
