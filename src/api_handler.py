@@ -11,7 +11,8 @@ from .shared import logger
 # Lambda handler with Mangum ASGI adapter
 # Use lifespan="off" for Lambda - execution environment persists between invocations
 # so startup events only need to run once per container lifecycle, not per request
-_mangum_handler = Mangum(app, lifespan="off")
+# api_gateway_base_path strips the stage prefix from rawPath (HTTP API includes /Prod/ in path)
+_mangum_handler = Mangum(app, lifespan="off", api_gateway_base_path="/Prod")
 
 
 def handler(event, context):
@@ -28,5 +29,9 @@ def handler(event, context):
     Returns:
         API Gateway response with HTTP status, headers, and body
     """
-    logger.info(f"HTTP API request: {event.get('httpMethod')} {event.get('path')}")
+    request_context = event.get('requestContext', {})
+    http_info = request_context.get('http', {})
+    method = http_info.get('method', 'UNKNOWN')
+    path = http_info.get('path', '/')
+    logger.info(f"HTTP API request: {method} {path}")
     return _mangum_handler(event, context)

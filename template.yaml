@@ -298,10 +298,11 @@ Resources:
           Required: true
           Mutable: false
 
-  # Cognito User Pool Client
+  # Cognito User Pool Client (web frontend)
   UserPoolClient:
     Type: AWS::Cognito::UserPoolClient
-    DependsOn: CloudFrontDistribution
+    DependsOn:
+      - CloudFrontDistribution
     Properties:
       ClientName: !Sub '${AWS::StackName}-client'
       UserPoolId: !Ref UserPool
@@ -347,6 +348,39 @@ Resources:
       Domain: !Sub '${AWS::StackName}-${AWS::AccountId}'
       UserPoolId: !Ref UserPool
 
+  # Resource Server for machine-to-machine OAuth scopes
+  # This defines custom scopes that can be used with client_credentials flow
+  ApiResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: !Sub '${AWS::StackName}-api'
+      Name: Stache API
+      Scopes:
+        - ScopeName: read
+          ScopeDescription: Read access to knowledge base (search, list, get)
+        - ScopeName: write
+          ScopeDescription: Write access to knowledge base (ingest, create, update, delete)
+
+  # Machine-to-machine client for stache-tools CLI/SDK
+  # Uses client_credentials flow with client secret
+  StacheToolsClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ApiResourceServer
+    Properties:
+      ClientName: !Sub '${AWS::StackName}-tools'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - client_credentials
+      AllowedOAuthScopes:
+        - !Sub '${AWS::StackName}-api/read'
+        - !Sub '${AWS::StackName}-api/write'
+      SupportedIdentityProviders:
+        - COGNITO
+      # No callback URLs needed for client_credentials flow
+
   # Lambda function for HTTP API (API Gateway + Cognito)
   ApiFunction:
     Type: AWS::Serverless::Function
@@ -390,27 +424,31 @@ Resources:
               Resource:
                 - !Sub '${S3VectorsBucket.VectorBucketArn}/index/*'
       Events:
-        # API Gateway HTTP events
-        HealthCheck:
-          Type: Api
+        # HTTP API events
+        Ping:
+          Type: HttpApi
           Properties:
-            Path: /health
+            Path: /ping
             Method: GET
-            RestApiId: !Ref StacheApi
+            ApiId: !Ref StacheHttpApi
             Auth:
               Authorizer: NONE
-        ApiRoot:
-          Type: Api
+        # OPTIONS must be unauthenticated for CORS preflight
+        OptionsProxy:
+          Type: HttpApi
           Properties:
-            Path: /
-            Method: ANY
-            RestApiId: !Ref StacheApi
-        ApiProxy:
-          Type: Api
+            Path: /{proxy+}
+            Method: OPTIONS
+            ApiId: !Ref StacheHttpApi
+            Auth:
+              Authorizer: NONE
+        # All other routes use default JWT authorizer
+        ApiRoutes:
+          Type: HttpApi
           Properties:
             Path: /{proxy+}
             Method: ANY
-            RestApiId: !Ref StacheApi
+            ApiId: !Ref StacheHttpApi
 
   # Lambda function for AgentCore Gateway (Claude Desktop MCP)
   AgentCoreFunction:
@@ -499,27 +537,44 @@ Resources:
         - Name: FunctionName
           Value: !Ref AgentCoreFunction
 
-  # API Gateway with Cognito Authorizer
-  StacheApi:
-    Type: AWS::Serverless::Api
+  # HTTP API Gateway with Cognito JWT Authorizer
+  # Why HTTP API: Supports both ID tokens (web frontend) and access tokens (M2M clients)
+  # with JWT validation that accepts either 'aud' (ID tokens) or 'client_id' (access tokens)
+  # matching the configured audience. This unified approach eliminates the need for
+  # separate OAuth scopes that break web frontend compatibility.
+  StacheHttpApi:
+    Type: AWS::Serverless::HttpApi
     DependsOn: CloudFrontDistribution
     Properties:
       StageName: Prod
-      Cors:
-        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
-        AllowHeaders: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+      CorsConfiguration:
+        # PE feedback: Reduce preflight overhead with long MaxAge (24 hours)
+        MaxAge: 86400
+        AllowOrigins:
+          - !Sub 'https://${CloudFrontDistribution.DomainName}'
+          - !If [UseCustomDomain, !Sub 'https://${AppDomain}', !Ref AWS::NoValue]
+          - 'http://localhost:3000'
+          - 'http://localhost:8000'
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
         AllowCredentials: true
-        # CORS origins: CloudFront + custom domain (if set) + localhost
-        AllowOrigin: !If
-          - UseCustomDomain
-          - !Sub "'https://${AppDomain}'"
-          - !Sub "'https://${CloudFrontDistribution.DomainName}'"
       Auth:
-        DefaultAuthorizer: CognitoAuthorizer
+        DefaultAuthorizer: CognitoJwtAuthorizer
         Authorizers:
-          CognitoAuthorizer:
-            UserPoolArn: !GetAtt UserPool.Arn
-        AddDefaultAuthorizerToCorsPreflight: false
+          CognitoJwtAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+              Audience:
+                - !Ref UserPoolClient
+                - !Ref StacheToolsClient
 
 Outputs:
   StacheLayerArn:
@@ -527,12 +582,18 @@ Outputs:
     Value: !Ref StacheLayer
 
   ApiUrl:
-    Description: API Gateway endpoint URL (HTTP API with Cognito auth)
-    Value: !Sub 'https://${StacheApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/'
+    Description: HTTP API Gateway endpoint URL (JWT authorizer)
+    Value: !Sub 'https://${StacheHttpApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/'
 
   ApiFunction:
     Description: HTTP API Lambda Function ARN
     Value: !GetAtt ApiFunction.Arn
+
+  ApiFunctionName:
+    Description: HTTP API Lambda Function name (for stache-tools Lambda transport)
+    Value: !Ref ApiFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiFunctionName'
 
   AgentCoreFunction:
     Description: AgentCore Lambda Function ARN (for Claude Desktop MCP)
@@ -557,8 +618,23 @@ Outputs:
       Name: !Sub '${AWS::StackName}-UserPoolId'
 
   UserPoolClientId:
-    Description: Cognito User Pool Client ID
+    Description: Cognito User Pool Client ID (for frontend)
     Value: !Ref UserPoolClient
+
+  # stache-tools machine-to-machine client outputs
+  StacheToolsClientId:
+    Description: Cognito client ID for stache-tools CLI/SDK
+    Value: !Ref StacheToolsClient
+    Export:
+      Name: !Sub '${AWS::StackName}-StacheToolsClientId'
+
+  StacheToolsTokenUrl:
+    Description: OAuth token endpoint for stache-tools
+    Value: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/token'
+
+  StacheToolsScopes:
+    Description: OAuth scopes for stache-tools
+    Value: !Sub '${AWS::StackName}-api/read ${AWS::StackName}-api/write'
 
   UserPoolDomain:
     Description: Cognito User Pool Domain

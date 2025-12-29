@@ -178,7 +178,108 @@ After deployment, add a CNAME record pointing your domain to the CloudFront dist
 
 Or use the **Create Cognito User** GitHub workflow.
 
-## AgentCore Gateway (Claude MCP)
+## stache-tools CLI & MCP
+
+The `stache-tools` package provides a CLI and MCP server for accessing Stache from the command line or Claude Desktop.
+
+### Installation
+
+```bash
+# HTTP transport only
+pip install stache-tools
+
+# With Lambda transport support (recommended)
+pip install stache-tools[lambda]
+```
+
+### Transport Options
+
+stache-tools supports two transport modes:
+
+| Transport | Authentication | Best For |
+|-----------|----------------|----------|
+| **Lambda** (recommended) | AWS IAM | CLI, Claude Desktop MCP, local development |
+| **HTTP** | OAuth (Cognito) | Web apps, multi-tenant scenarios |
+
+### Lambda Transport (Recommended)
+
+Uses direct Lambda invocation with your AWS credentials. No OAuth setup needed.
+
+```bash
+# Set environment variables
+export STACHE_LAMBDA_FUNCTION=stache-api
+export AWS_REGION=us-east-1
+
+# Test the connection
+stache health
+
+# Search
+stache search "your query"
+```
+
+**Required IAM Permission:**
+```json
+{
+    "Effect": "Allow",
+    "Action": "lambda:InvokeFunction",
+    "Resource": "arn:aws:lambda:us-east-1:ACCOUNT:function:stache-api"
+}
+```
+
+### HTTP Transport (OAuth)
+
+Uses API Gateway with Cognito OAuth. The deploy script outputs the credentials:
+
+```bash
+# Set environment variables (shown in deploy.sh output)
+export STACHE_API_URL=https://xxx.execute-api.us-east-1.amazonaws.com/Prod/
+export STACHE_COGNITO_CLIENT_ID=abc123...
+export STACHE_COGNITO_CLIENT_SECRET=xyz789...
+export STACHE_COGNITO_TOKEN_URL=https://xxx.auth.us-east-1.amazoncognito.com/oauth2/token
+export STACHE_COGNITO_SCOPE="stache-serverless-api/read stache-serverless-api/write"
+
+# Test the connection
+stache health
+```
+
+### Claude Desktop MCP (Lambda)
+
+Add to `~/.config/claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "stache": {
+      "command": "stache-mcp",
+      "env": {
+        "STACHE_LAMBDA_FUNCTION": "stache-api",
+        "AWS_REGION": "us-east-1"
+      }
+    }
+  }
+}
+```
+
+### Deployment Output
+
+After running `./scripts/deploy.sh`, the complete stache-tools configuration is shown:
+
+```
+=== stache-tools Configuration ===
+
+Option 1: Lambda Transport (Recommended)
+  export STACHE_LAMBDA_FUNCTION=stache-api
+  export AWS_REGION=us-east-1
+
+Option 2: HTTP Transport (OAuth)
+  export STACHE_API_URL=https://...
+  export STACHE_COGNITO_CLIENT_ID=...
+  ...
+```
+
+---
+
+## AgentCore Gateway (Claude Web MCP)
 
 AgentCore Gateway enables Claude to access Stache via MCP (Model Context Protocol). This works with Claude Web using OAuth auto-authentication.
 
