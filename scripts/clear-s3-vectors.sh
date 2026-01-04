@@ -4,7 +4,12 @@
 
 set -e
 
-BUCKET="stache-vectors-031374266151"
+# Get AWS account ID dynamically
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+REGION=${AWS_REGION:-us-east-1}
+PREFIX=${RESOURCE_PREFIX:-stache}
+
+BUCKET="${PREFIX}-vectors-${ACCOUNT_ID}"
 INDEXES=("documents" "summaries" "insights")
 DRY_RUN=false
 
@@ -13,8 +18,11 @@ if [[ "$1" == "--dry-run" ]]; then
     echo "=== DRY RUN MODE ==="
 fi
 
+echo "Account: $ACCOUNT_ID"
+echo "Bucket: $BUCKET"
+
 for INDEX in "${INDEXES[@]}"; do
-    INDEX_ARN="arn:aws:s3vectors:us-east-1:031374266151:bucket/${BUCKET}/index/${INDEX}"
+    INDEX_ARN="arn:aws:s3vectors:${REGION}:${ACCOUNT_ID}:bucket/${BUCKET}/index/${INDEX}"
 
     echo ""
     echo "=== Index: $INDEX ==="

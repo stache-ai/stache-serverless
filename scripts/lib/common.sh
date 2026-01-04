@@ -252,6 +252,77 @@ deploy_frontend() {
     print_success "CloudFront cache invalidated"
 }
 
+# Generate .env file for local development
+generate_local_env() {
+    local output_file="$1"
+    local role_arn=$(get_stack_output "$STACK_NAME" "ApiFunctionRoleArn")
+    local index_arn=$(get_stack_output "$STACK_NAME" "S3VectorsIndexArn")
+
+    cat > "$output_file" << EOF
+# Stache Local Development Environment
+# Generated from stack: $STACK_NAME
+# Region: $AWS_REGION
+# Generated: $(date -Iseconds)
+
+# =============================================================================
+# AWS CREDENTIALS
+# =============================================================================
+# Option 1: Assume the Lambda's IAM role (has all required permissions)
+#   aws sts assume-role --role-arn "$role_arn" --role-session-name local-dev
+#
+# Option 2: Use your own IAM user/role with equivalent permissions
+#   Required: s3vectors:*, dynamodb:* on stache tables, bedrock:InvokeModel
+# =============================================================================
+
+# AWS Provider Configuration
+VECTORDB_PROVIDER=s3vectors
+NAMESPACE_PROVIDER=dynamodb
+LLM_PROVIDER=bedrock
+EMBEDDING_PROVIDER=bedrock
+ENABLE_DOCUMENT_INDEX=true
+
+# AWS Region
+AWS_REGION=$AWS_REGION
+
+# S3 Vectors Index
+S3VECTORS_INDEX_ARN=$index_arn
+
+# DynamoDB Tables
+DYNAMODB_TABLE_NAME=${RESOURCE_PREFIX}-namespaces
+DYNAMODB_DOCUMENT_INDEX_TABLE=${RESOURCE_PREFIX}-documents
+
+# Lambda IAM Role (for assuming)
+STACHE_LAMBDA_ROLE_ARN=$role_arn
+
+# =============================================================================
+# STACHE-TOOLS / MCP CONFIGURATION
+# =============================================================================
+
+# API URL (if using HTTP transport)
+STACHE_API_URL=$API_URL
+
+# Lambda Function (if using Lambda transport - recommended)
+STACHE_LAMBDA_FUNCTION=$API_FUNCTION_NAME
+
+# Cognito OAuth (for HTTP transport)
+STACHE_COGNITO_CLIENT_ID=$STACHE_TOOLS_CLIENT_ID
+STACHE_COGNITO_CLIENT_SECRET=$STACHE_TOOLS_CLIENT_SECRET
+STACHE_COGNITO_TOKEN_URL=$STACHE_TOOLS_TOKEN_URL
+STACHE_COGNITO_SCOPE=$STACHE_TOOLS_SCOPES
+EOF
+
+    print_success "Local environment file written to: $output_file"
+    echo ""
+    echo "Usage:"
+    echo "  source $output_file                    # Load into shell"
+    echo "  # Or use python-dotenv in your code"
+    echo ""
+    echo "To assume the Lambda role for local dev:"
+    echo "  eval \$(aws sts assume-role --role-arn \"$role_arn\" \\"
+    echo "    --role-session-name local-dev --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \\"
+    echo "    --output text | awk '{print \"export AWS_ACCESS_KEY_ID=\"\$1\" AWS_SECRET_ACCESS_KEY=\"\$2\" AWS_SESSION_TOKEN=\"\$3}')"
+}
+
 # Print deployment summary
 print_deploy_summary() {
     print_header "Deployment Complete"

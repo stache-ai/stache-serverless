@@ -679,3 +679,11 @@ Outputs:
       - UseCustomDomain
       - !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${UserPoolClient}&response_type=token&scope=email+openid+profile&redirect_uri=https://${AppDomain}'
       - !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${UserPoolClient}&response_type=token&scope=email+openid+profile&redirect_uri=https://${CloudFrontDistribution.DomainName}'
+
+  ApiFunctionRoleArn:
+    Description: IAM role ARN for API Lambda (assume this for local dev)
+    Value: !GetAtt ApiFunctionRole.Arn
+
+  S3VectorsIndexArn:
+    Description: S3 Vectors index ARN
+    Value: !GetAtt VectorsIndex.IndexArn
