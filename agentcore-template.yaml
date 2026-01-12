@@ -13,6 +13,13 @@ Parameters:
     Type: String
     Description: Name of the main stache-serverless stack
     Default: "stache-serverless"
+  CustomMCPDomain:
+    Type: String
+    Description: Custom domain for MCP endpoint (e.g., stache.example.com) - optional
+    Default: ""
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref CustomMCPDomain, ""]]
 
 Resources:
   # MCP Resource Server - defines custom OAuth scopes for MCP access
@@ -29,7 +36,7 @@ Resources:
         - ScopeName: write
           ScopeDescription: Write access to knowledge base
 
-  # MCP Confidential Client - OAuth client for Claude Web
+  # MCP Confidential Client - OAuth client for Claude Web (authorization code flow)
   # Claude requires client_id + client_secret to be provided manually
   MCPUserPoolClient:
     Type: AWS::Cognito::UserPoolClient
@@ -58,6 +65,440 @@ Resources:
         - 'https://vscode.dev/redirect'
       SupportedIdentityProviders:
         - COGNITO
+
+  # OAuth Metadata API - serves well-known endpoints for MCP OAuth discovery
+  # Claude Code uses these to discover authorization server and registration endpoint
+  OAuthMetadataApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ResourcePrefix}-oauth-metadata'
+      Description: OAuth metadata endpoints for MCP discovery
+
+  # /.well-known resource
+  WellKnownResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref OAuthMetadataApi
+      ParentId: !GetAtt OAuthMetadataApi.RootResourceId
+      PathPart: '.well-known'
+
+  # /.well-known/oauth-authorization-server resource
+  OAuthAuthServerResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref OAuthMetadataApi
+      ParentId: !Ref WellKnownResource
+      PathPart: 'oauth-authorization-server'
+
+  # /.well-known/oauth-protected-resource resource
+  # This is used when proxying MCP through CloudFront with a custom domain
+  OAuthProtectedResourceResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref OAuthMetadataApi
+      ParentId: !Ref WellKnownResource
+      PathPart: 'oauth-protected-resource'
+
+  # GET /.well-known/oauth-protected-resource - returns protected resource metadata
+  # Points to our OAuth API and the MCP resource URL (custom domain if configured)
+  OAuthProtectedResourceMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OAuthMetadataApi
+      ResourceId: !Ref OAuthProtectedResourceResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Content-Type: "'application/json'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: !If
+                - HasCustomDomain
+                - !Sub |
+                    {
+                      "authorization_servers": ["https://${CustomMCPDomain}/.well-known/openid-configuration"],
+                      "resource": "https://${CustomMCPDomain}/mcp"
+                    }
+                - !Sub |
+                    {
+                      "authorization_servers": ["https://${OAuthMetadataApi}.execute-api.${AWS::Region}.amazonaws.com/prod"],
+                      "resource": "https://${ResourcePrefix}-mcp-gateway.gateway.bedrock-agentcore.${AWS::Region}.amazonaws.com/mcp"
+                    }
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Content-Type: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # /.well-known/openid-configuration resource (for OIDC discovery compatibility)
+  OIDCConfigResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref OAuthMetadataApi
+      ParentId: !Ref WellKnownResource
+      PathPart: 'openid-configuration'
+
+  # GET /.well-known/oauth-authorization-server - returns auth server metadata
+  OAuthAuthServerMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OAuthMetadataApi
+      ResourceId: !Ref OAuthAuthServerResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Content-Type: "'application/json'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: !Sub
+                - |
+                  {
+                    "issuer": "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}",
+                    "authorization_endpoint": "https://${UserPoolDomain}/oauth2/authorize",
+                    "token_endpoint": "https://${UserPoolDomain}/oauth2/token",
+                    "registration_endpoint": "https://${OAuthMetadataApi}.execute-api.${AWS::Region}.amazonaws.com/prod/register",
+                    "scopes_supported": ["openid", "email", "profile", "${ResourcePrefix}-mcp/read", "${ResourcePrefix}-mcp/write"],
+                    "response_types_supported": ["code"],
+                    "grant_types_supported": ["authorization_code", "refresh_token"],
+                    "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
+                    "code_challenge_methods_supported": ["S256"]
+                  }
+                - UserPoolId: !ImportValue
+                    Fn::Sub: '${MainStackName}-UserPoolId'
+                  UserPoolDomain: !ImportValue
+                    Fn::Sub: '${MainStackName}-UserPoolDomain'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Content-Type: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Note: /.well-known/oauth-protected-resource is served by AgentCore Gateway itself
+  # We don't need to serve it from our API - the gateway returns this metadata
+  # pointing to our authorization_servers (the OIDC endpoint we serve)
+
+  # GET /.well-known/openid-configuration - OIDC-compatible discovery with DCR support
+  # This endpoint is used by AgentCore Gateway for JWT validation and authorization_servers
+  OIDCConfigMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OAuthMetadataApi
+      ResourceId: !Ref OIDCConfigResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Content-Type: "'application/json'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: !Sub
+                - |
+                  {
+                    "issuer": "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}",
+                    "authorization_endpoint": "https://${UserPoolDomain}/oauth2/authorize",
+                    "token_endpoint": "https://${UserPoolDomain}/oauth2/token",
+                    "userinfo_endpoint": "https://${UserPoolDomain}/oauth2/userInfo",
+                    "revocation_endpoint": "https://${UserPoolDomain}/oauth2/revoke",
+                    "jwks_uri": "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}/.well-known/jwks.json",
+                    "registration_endpoint": "https://${OAuthMetadataApi}.execute-api.${AWS::Region}.amazonaws.com/prod/register",
+                    "scopes_supported": ["openid", "email", "phone", "profile", "${ResourcePrefix}-mcp/read", "${ResourcePrefix}-mcp/write"],
+                    "response_types_supported": ["code", "token"],
+                    "grant_types_supported": ["authorization_code", "refresh_token"],
+                    "subject_types_supported": ["public"],
+                    "id_token_signing_alg_values_supported": ["RS256"],
+                    "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
+                    "code_challenge_methods_supported": ["S256"]
+                  }
+                - UserPoolId: !ImportValue
+                    Fn::Sub: '${MainStackName}-UserPoolId'
+                  UserPoolDomain: !ImportValue
+                    Fn::Sub: '${MainStackName}-UserPoolDomain'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Content-Type: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Dynamic Client Registration (DCR) - allows Claude Code to auto-register OAuth clients
+  # /register resource
+  RegisterResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref OAuthMetadataApi
+      ParentId: !GetAtt OAuthMetadataApi.RootResourceId
+      PathPart: 'register'
+
+  # DCR Lambda execution role
+  DCRLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-dcr-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DCRPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:CreateUserPoolClient
+                  - cognito-idp:DescribeUserPoolClient
+                Resource: !Sub
+                  - 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPoolId}'
+                  - UserPoolId: !ImportValue
+                      Fn::Sub: '${MainStackName}-UserPoolId'
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:ListGateways
+                  - bedrock-agentcore:GetGateway
+                  - bedrock-agentcore:UpdateGateway
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt AgentCoreGatewayRole.Arn
+
+  # DCR Lambda function - handles OAuth client registration
+  # Note: GATEWAY_NAME is used to find the gateway at runtime to avoid circular dependency
+  DCRLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-dcr'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DCRLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          USER_POOL_ID: !ImportValue
+            Fn::Sub: '${MainStackName}-UserPoolId'
+          GATEWAY_NAME: !Sub '${ResourcePrefix}-mcp-gateway'
+          RESOURCE_PREFIX: !Ref ResourcePrefix
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import re
+          import boto3
+          import uuid
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          cognito = boto3.client('cognito-idp')
+          agentcore = boto3.client('bedrock-agentcore-control')
+
+          def find_gateway_by_name(name):
+              """Find gateway ID by name since we can't reference it directly (circular dep)"""
+              try:
+                  paginator = agentcore.get_paginator('list_gateways')
+                  for page in paginator.paginate():
+                      for gw in page.get('items', []):
+                          if gw.get('name') == name:
+                              return gw.get('gatewayId')
+              except Exception as e:
+                  logger.error(f"Failed to find gateway: {e}")
+              return None
+
+          def handler(event, context):
+              logger.info(f"DCR request: {json.dumps(event)}")
+
+              # Parse request body
+              try:
+                  body = json.loads(event.get('body', '{}'))
+              except json.JSONDecodeError:
+                  return response(400, {'error': 'invalid_request', 'error_description': 'Invalid JSON body'})
+
+              # Extract client metadata
+              raw_client_name = body.get('client_name', f"dcr-client-{uuid.uuid4().hex[:8]}")
+              # Sanitize client name - Cognito only allows [\w\s+=,.@-]+
+              # Replace parentheses and other invalid chars with hyphens
+              client_name = re.sub(r'[^\w\s+=,.@-]', '-', raw_client_name)
+              redirect_uris = body.get('redirect_uris', ['http://127.0.0.1:33418', 'http://localhost:33418'])
+
+              # Validate redirect URIs
+              if not isinstance(redirect_uris, list) or not redirect_uris:
+                  return response(400, {'error': 'invalid_redirect_uri', 'error_description': 'redirect_uris must be a non-empty array'})
+
+              user_pool_id = os.environ['USER_POOL_ID']
+              gateway_name = os.environ['GATEWAY_NAME']
+              prefix = os.environ['RESOURCE_PREFIX']
+
+              try:
+                  # Create Cognito client
+                  client_response = cognito.create_user_pool_client(
+                      UserPoolId=user_pool_id,
+                      ClientName=client_name,
+                      GenerateSecret=True,
+                      ExplicitAuthFlows=['ALLOW_USER_SRP_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+                      AllowedOAuthFlows=['code'],
+                      AllowedOAuthScopes=['email', 'openid', 'phone', 'profile', f'{prefix}-mcp/read', f'{prefix}-mcp/write'],
+                      AllowedOAuthFlowsUserPoolClient=True,
+                      CallbackURLs=redirect_uris,
+                      SupportedIdentityProviders=['COGNITO']
+                  )
+
+                  client_id = client_response['UserPoolClient']['ClientId']
+                  client_secret = client_response['UserPoolClient']['ClientSecret']
+
+                  logger.info(f"Created Cognito client: {client_id}")
+
+                  # Add client to gateway AllowedClients
+                  # Find gateway by name to avoid circular CloudFormation dependency
+                  gateway_id = find_gateway_by_name(gateway_name)
+                  if gateway_id:
+                      try:
+                          gateway = agentcore.get_gateway(gatewayIdentifier=gateway_id)
+
+                          current_clients = gateway.get('authorizerConfiguration', {}).get('customJWTAuthorizer', {}).get('allowedClients', [])
+                          updated_clients = list(set(current_clients + [client_id]))
+
+                          agentcore.update_gateway(
+                              gatewayIdentifier=gateway_id,
+                              name=gateway['name'],
+                              roleArn=gateway['roleArn'],
+                              protocolType=gateway['protocolType'],
+                              authorizerType=gateway['authorizerType'],
+                              authorizerConfiguration={
+                                  'customJWTAuthorizer': {
+                                      'discoveryUrl': gateway['authorizerConfiguration']['customJWTAuthorizer']['discoveryUrl'],
+                                      'allowedClients': updated_clients
+                                  }
+                              }
+                          )
+                          logger.info(f"Added client {client_id} to gateway AllowedClients")
+                      except Exception as e:
+                          logger.error(f"Failed to update gateway: {e}")
+                  else:
+                      logger.warning(f"Gateway '{gateway_name}' not found - client created but not added to AllowedClients")
+
+                  # Return RFC 7591 compliant response
+                  return response(201, {
+                      'client_id': client_id,
+                      'client_secret': client_secret,
+                      'client_name': client_name,
+                      'redirect_uris': redirect_uris,
+                      'token_endpoint_auth_method': 'client_secret_basic',
+                      'grant_types': ['authorization_code', 'refresh_token'],
+                      'response_types': ['code']
+                  })
+
+              except cognito.exceptions.InvalidParameterException as e:
+                  logger.error(f"Invalid parameter: {e}")
+                  return response(400, {'error': 'invalid_request', 'error_description': str(e)})
+              except Exception as e:
+                  logger.error(f"DCR failed: {e}")
+                  return response(500, {'error': 'server_error', 'error_description': 'Client registration failed'})
+
+          def response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type',
+                      'Access-Control-Allow-Methods': 'POST, OPTIONS'
+                  },
+                  'body': json.dumps(body)
+              }
+
+  # Lambda permission for API Gateway
+  DCRLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DCRLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${OAuthMetadataApi}/*'
+
+  # POST /register - DCR endpoint
+  RegisterMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn: DCRLambdaPermission
+    Properties:
+      RestApiId: !Ref OAuthMetadataApi
+      ResourceId: !Ref RegisterResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DCRLambda.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: '201'
+        - StatusCode: '400'
+        - StatusCode: '500'
+
+  # OPTIONS /register - CORS preflight
+  RegisterOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OAuthMetadataApi
+      ResourceId: !Ref RegisterResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  # Deploy the OAuth/DCR API
+  # Note: Change logical ID (e.g., V6) to force redeployment when methods change
+  OAuthMetadataDeploymentV6:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - OAuthAuthServerMethod
+      - OIDCConfigMethod
+      - OAuthProtectedResourceMethod
+      - RegisterMethod
+      - RegisterOptionsMethod
+    Properties:
+      RestApiId: !Ref OAuthMetadataApi
+
+  OAuthMetadataStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref OAuthMetadataApi
+      DeploymentId: !Ref OAuthMetadataDeploymentV6
+      StageName: prod
 
   # IAM Role for AgentCore Gateway to invoke Lambda
   AgentCoreGatewayRole:
@@ -95,11 +536,13 @@ Resources:
       SourceArn: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:gateway/*'
 
   # AgentCore MCP Gateway
+  # Uses our custom OIDC endpoint that includes registration_endpoint for DCR
   MCPGateway:
     Type: AWS::BedrockAgentCore::Gateway
     DependsOn:
       - AgentCoreGatewayRole
       - MCPUserPoolClient
+      - OAuthMetadataStage
     Properties:
       Name: !Sub '${ResourcePrefix}-mcp-gateway'
       Description: Stache AI MCP Gateway
@@ -108,12 +551,10 @@ Resources:
       RoleArn: !GetAtt AgentCoreGatewayRole.Arn
       AuthorizerConfiguration:
         CustomJWTAuthorizer:
-          DiscoveryUrl: !Sub
-            - 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}/.well-known/openid-configuration'
-            - UserPoolId: !ImportValue
-                Fn::Sub: '${MainStackName}-UserPoolId'
+          DiscoveryUrl: !Sub 'https://${OAuthMetadataApi}.execute-api.${AWS::Region}.amazonaws.com/prod/.well-known/openid-configuration'
           AllowedClients:
             - !Ref MCPUserPoolClient
+            # Additional clients created via register-claude-client.sh are added dynamically
 
   # Gateway Target - Lambda with tool schema
   MCPGatewayTarget:
@@ -149,6 +590,9 @@ Resources:
                       rerank:
                         Type: boolean
                         Description: Rerank results for relevance (default true)
+                      filter:
+                        Type: object
+                        Description: 'Metadata filter (e.g. {"source": "docs"})'
                     Required:
                       - query
                 - Name: ingest_text
@@ -165,6 +609,12 @@ Resources:
                       namespace:
                         Type: string
                         Description: Optional namespace to organize content (default 'default')
+                      chunking_strategy:
+                        Type: string
+                        Description: Chunking strategy (recursive, markdown, semantic, character). Default recursive.
+                      prepend_metadata:
+                        Type: array
+                        Description: Metadata keys to prepend to chunks for better search (e.g. ['author', 'topic'])
                     Required:
                       - text
                 - Name: list_namespaces
@@ -182,7 +632,7 @@ Resources:
                         Description: Filter documents by namespace
                       limit:
                         Type: integer
-                        Description: Maximum documents to return (max 100, default 100)
+                        Description: Maximum documents to return (max 100, default 50)
                       next_key:
                         Type: string
                         Description: Pagination token from previous response
@@ -274,10 +724,14 @@ Resources:
 
 Outputs:
   MCPClientId:
-    Description: Cognito MCP Client ID
+    Description: Cognito MCP Client ID (for Claude Web - authorization code flow)
     Value: !Ref MCPUserPoolClient
     Export:
       Name: !Sub '${AWS::StackName}-MCPClientId'
+
+  OAuthMetadataUrl:
+    Description: OAuth metadata API URL (for MCP OAuth discovery)
+    Value: !Sub 'https://${OAuthMetadataApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
 
   GatewayRoleArn:
     Description: IAM Role ARN for AgentCore Gateway
@@ -315,3 +769,15 @@ Outputs:
     Description: AgentCore Lambda ARN (from main stack)
     Value: !ImportValue
       Fn::Sub: '${MainStackName}-AgentCoreFunctionArn'
+
+  OAuthMetadataApiId:
+    Description: OAuth Metadata API ID (for CloudFront MCP proxy)
+    Value: !Ref OAuthMetadataApi
+
+  MCPGatewayDomain:
+    Description: MCP Gateway domain (for CloudFront MCP proxy)
+    Value: !Select
+      - 2
+      - !Split
+        - /
+        - !GetAtt MCPGateway.GatewayUrl

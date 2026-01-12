@@ -17,7 +17,6 @@ Parameters:
     Type: String
     Description: ACM certificate ARN for custom domain (required if AppDomain is set)
     Default: ""
-
 Conditions:
   UseCustomDomain: !Not [!Equals [!Ref AppDomain, ""]]
 
@@ -406,6 +405,12 @@ Resources:
                 - bedrock:InvokeModelWithResponseStream
                 - bedrock:Converse
               Resource: '*'
+            # Marketplace permissions for Bedrock model access
+            - Effect: Allow
+              Action:
+                - aws-marketplace:ViewSubscriptions
+                - aws-marketplace:Subscribe
+              Resource: '*'
             - Effect: Allow
               Action:
                 - s3vectors:GetVectorBucket
@@ -474,6 +479,12 @@ Resources:
                 - bedrock:InvokeModel
                 - bedrock:InvokeModelWithResponseStream
                 - bedrock:Converse
+              Resource: '*'
+            # Marketplace permissions for Bedrock model access
+            - Effect: Allow
+              Action:
+                - aws-marketplace:ViewSubscriptions
+                - aws-marketplace:Subscribe
               Resource: '*'
             - Effect: Allow
               Action:
@@ -665,6 +676,10 @@ Outputs:
   CloudFrontDomain:
     Description: CloudFront distribution domain
     Value: !GetAtt CloudFrontDistribution.DomainName
+
+  AppDomain:
+    Description: Custom domain (if configured)
+    Value: !If [UseCustomDomain, !Ref AppDomain, '']
 
   FrontendUrl:
     Description: Frontend URL (custom domain or CloudFront)

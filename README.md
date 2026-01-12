@@ -85,13 +85,25 @@ All scripts support a `--prefix` flag for multiple deployments in the same AWS a
 # Skip frontend build (faster for backend-only changes)
 ./scripts/deploy.sh --skip-frontend
 
+# Skip backend deployment (frontend only)
+./scripts/deploy.sh --skip-backend
+
 # Skip Lambda layer build (use existing)
 ./scripts/deploy.sh --skip-layer
+
+# Just redeploy SAM (skip layer, sam build, and frontend)
+./scripts/deploy.sh -s
+# or
+./scripts/deploy.sh --sam-only
+
+# Build from local source instead of PyPI
+./scripts/deploy.sh --from-source
+./scripts/deploy.sh --from-source /path/to/stache
 ```
 
 Environment variables:
 - `RESOURCE_PREFIX` - Same as `--prefix` (default: `stache`)
-- `STACHE_REPO` - Path to stache-ai repo (default: `../stache`)
+- `STACHE_FROM_SOURCE` - Path to stache-ai repo for source builds (or `true` for `../stache`)
 - `AWS_REGION` - AWS region (default: `us-east-1`)
 - `AWS_PROFILE` - AWS CLI profile to use (optional)
 
@@ -106,23 +118,45 @@ AWS_PROFILE=myprofile ./scripts/deploy.sh --prefix prod
 
 | Secret | Description |
 |--------|-------------|
-| `AWS_ACCESS_KEY_ID` | IAM access key |
-| `AWS_SECRET_ACCESS_KEY` | IAM secret key |
+| `AWS_ACCESS_KEY_ID` | IAM access key (not needed if using OIDC) |
+| `AWS_SECRET_ACCESS_KEY` | IAM secret key (not needed if using OIDC) |
+| `AWS_ACCOUNT_ID` | AWS account ID (required only for OIDC authentication) |
 | `STACHE_REPO_TOKEN` | GitHub token with access to stache-ai/stache-ai (if private) |
+
+#### OIDC Authentication (Recommended)
+
+All workflows support OIDC authentication as an alternative to access keys. To use OIDC:
+
+1. Deploy `github-oidc.yaml` to create the OIDC provider and IAM role
+2. Set the `AWS_ACCOUNT_ID` secret
+3. Enable `use_oidc: true` when running workflows
+
+See [github-oidc.yaml](github-oidc.yaml) for the CloudFormation template.
 
 #### Available Workflows
 
-**Deploy to AWS** (`deploy.yml`)
-- Builds Lambda layer, deploys SAM stack, builds and deploys frontend
-- Inputs: `resource_prefix`, `app_domain`, `certificate_arn`
+**Deploy Stache** (`deploy.yml`)
+- Combined workflow for all deployment actions
+- Action options:
+  - `full` (default) - Deploy main stack + AgentCore + create user (if email provided)
+  - `stack-only` - Deploy main stack and frontend only
+  - `agentcore-only` - Deploy AgentCore gateway only (requires main stack)
+  - `user-only` - Create Cognito user only (requires main stack)
+  - `delete` - Delete both stacks (AgentCore first, then main)
+- Inputs:
+  - `action` - What to deploy (full, stack-only, agentcore-only, user-only, delete)
+  - `resource_prefix` - Resource prefix (default: stache)
+  - `app_domain` - Custom domain (optional)
+  - `certificate_arn` - ACM certificate ARN (auto-detected from domain)
+  - `use_oidc` - Use OIDC instead of access keys
+  - `frontend_source` - "latest" (default), version (e.g., "0.1.0"), or "build" for source
+  - `frontend_package` - npm package name (default: @stache-ai/frontend)
+  - `user_email` - Email for new Cognito user (optional, used with `full` or `user-only`)
 
 **Setup Custom Domain** (`setup-custom-domain.yml`)
 - Creates ACM certificate and outputs DNS validation records
-- Inputs: `resource_prefix`, `domain`
-
-**Create Cognito User** (`create-user.yml`)
-- Creates a user in Cognito with auto-generated password
-- Inputs: `resource_prefix`, `email`
+- Must be run separately before deploy (requires DNS validation wait)
+- Inputs: `resource_prefix`, `domain`, `use_oidc`
 
 #### Running a Workflow
 
@@ -176,7 +210,7 @@ After deployment, add a CNAME record pointing your domain to the CloudFront dist
 ./scripts/create-user.sh user@example.com "MyP@ssw0rd!"
 ```
 
-Or use the **Create Cognito User** GitHub workflow.
+Or use the **Deploy Stache** GitHub workflow with `action: user-only`.
 
 ## stache-tools CLI & MCP
 
@@ -260,6 +294,46 @@ Add to `~/.config/claude/claude_desktop_config.json`:
 }
 ```
 
+#### Using a Wrapper Script (Recommended)
+
+Instead of inline env vars, use a wrapper script for cleaner configuration and venv support:
+
+1. Create `~/.stache.env`:
+   ```bash
+   STACHE_LAMBDA_FUNCTION=stache-api
+   AWS_REGION=us-east-1
+   # Optional: AWS_PROFILE=my-profile
+   ```
+
+2. Create `~/.local/bin/stache-mcp-wrapper`:
+   ```bash
+   #!/bin/bash
+   source ~/.stache.env
+
+   # Optional: activate venv if stache-tools is installed there
+   # source ~/venvs/stache/bin/activate
+
+   exec stache-mcp "$@"
+   ```
+
+3. Make it executable:
+   ```bash
+   chmod +x ~/.local/bin/stache-mcp-wrapper
+   ```
+
+4. Update Claude config:
+   ```json
+   {
+     "mcpServers": {
+       "stache": {
+         "command": "/home/user/.local/bin/stache-mcp-wrapper"
+       }
+     }
+   }
+   ```
+
+This approach lets you manage configuration separately and supports virtual environments.
+
 ### Deployment Output
 
 After running `./scripts/deploy.sh`, the complete stache-tools configuration is shown:
@@ -330,6 +404,7 @@ The credentials are also saved to `.agentcore-config.json` for reference.
 | `list_namespaces` | List all namespaces |
 | `list_documents` | List documents (with pagination) |
 | `get_document` | Get document metadata by ID |
+| `delete_document` | Delete a document and its chunks |
 | `create_namespace` | Create a new namespace |
 | `get_namespace` | Get namespace details |
 | `update_namespace` | Update namespace name/description |
@@ -438,6 +513,7 @@ Configured in `template.yaml` Globals section:
 | `VECTORDB_PROVIDER` | s3vectors | Vector database |
 | `NAMESPACE_PROVIDER` | dynamodb | Namespace storage |
 | `DOCUMENT_INDEX_PROVIDER` | dynamodb | Document index |
+| `RERANKER_PROVIDER` | simple | Reranking provider |
 | `BEDROCK_LLM_MODEL` | anthropic.claude-3-5-sonnet-20241022-v2:0 | Claude model |
 | `BEDROCK_EMBEDDING_MODEL` | cohere.embed-english-v3 | Cohere embeddings |
 

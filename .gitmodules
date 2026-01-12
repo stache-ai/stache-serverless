@@ -1,0 +1,3 @@
+[submodule "stache-frontend"]
+	path = stache-frontend
+	url = https://github.com/stache-ai/stache-ai.git

@@ -18,18 +18,26 @@ source "$SCRIPT_DIR/lib/common.sh"
 DOMAIN=""
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --prefix)
+            set_prefix "$2"
+            shift 2
+            ;;
         -h|--help)
-            echo "Usage: $0 <domain>"
+            echo "Usage: $0 [--prefix <prefix>] <domain>"
             echo ""
             echo "Create an ACM certificate for a custom domain."
             echo ""
+            echo "Options:"
+            echo "  --prefix <prefix>  Resource prefix (default: stache)"
+            echo ""
             echo "Examples:"
             echo "  $0 stache.example.com"
+            echo "  $0 --prefix myapp stache.example.com"
             exit 0
             ;;
         -*)
             print_error "Unknown option: $1"
-            echo "Usage: $0 <domain>"
+            echo "Usage: $0 [--prefix <prefix>] <domain>"
             exit 1
             ;;
         *)
@@ -87,7 +95,7 @@ else
         --domain-name "$DOMAIN" \
         --validation-method DNS \
         --region "$AWS_REGION" \
-        --tags Key=Name,Value="$DOMAIN" Key=Project,Value=stache \
+        --tags Key=Name,Value="$DOMAIN" Key=Project,Value="$RESOURCE_PREFIX" \
         --query 'CertificateArn' \
         --output text)
 

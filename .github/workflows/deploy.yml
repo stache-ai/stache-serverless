@@ -1,10 +1,21 @@
-name: Deploy to AWS
+name: Deploy Stache
 
 on:
   workflow_dispatch:
     inputs:
+      action:
+        description: 'What to deploy'
+        required: true
+        type: choice
+        options:
+          - 'full'
+          - 'stack-only'
+          - 'agentcore-only'
+          - 'user-only'
+          - 'delete'
+        default: 'full'
       resource_prefix:
-        description: 'Resource prefix (default: stache, allows multiple deployments)'
+        description: 'Resource prefix (default: stache)'
         required: false
         type: string
         default: 'stache'
@@ -16,9 +27,39 @@ on:
         description: 'ACM certificate ARN (optional, auto-detected from domain)'
         required: false
         type: string
+      use_oidc:
+        description: 'Use OIDC authentication (requires AWS_ACCOUNT_ID secret)'
+        required: false
+        type: boolean
+        default: false
+      backend_source:
+        description: 'Backend: "pypi" (default) or "build" for source from stache-frontend submodule'
+        required: false
+        type: string
+        default: 'pypi'
+      frontend_source:
+        description: 'Frontend: "latest" (default), version (e.g., 0.1.0), or "build" for source'
+        required: false
+        type: string
+        default: 'latest'
+      frontend_package:
+        description: 'npm package for frontend (default: @stache-ai/frontend)'
+        required: false
+        type: string
+        default: '@stache-ai/frontend'
+      user_email:
+        description: 'Email for new Cognito user (optional, for full or user-only)'
+        required: false
+        type: string
 
 env:
   AWS_REGION: us-east-1
+  AWS_PAGER: ""
+
+# Prevent concurrent deployments to the same prefix
+concurrency:
+  group: deploy-${{ github.event.inputs.resource_prefix || 'stache' }}
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -27,63 +68,63 @@ jobs:
     permissions:
       id-token: write
       contents: read
+      packages: read
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Set up Python
+        if: ${{ inputs.action == 'full' || inputs.action == 'stack-only' }}
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
       - name: Set up Node.js
+        if: ${{ inputs.action == 'full' || inputs.action == 'stack-only' }}
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Set up AWS SAM CLI
+        if: ${{ inputs.action == 'full' || inputs.action == 'stack-only' }}
         uses: aws-actions/setup-sam@v2
         with:
           use-installer: true
 
-      - name: Configure AWS credentials
+      - name: Install AWS CLI
+        run: |
+          if ! command -v aws &> /dev/null; then
+            curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+            rm -rf aws awscliv2.zip
+          fi
+
+      - name: Install jq
+        run: |
+          if ! command -v jq &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
+
+      # Option A: OIDC authentication (set use_oidc=true)
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ inputs.use_oidc }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          # Method A: IAM Access Keys (if AWS_ACCESS_KEY_ID is set)
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          # Method B: OIDC (if AWS_ACCOUNT_ID is set - uncomment line below)
-          # role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-stache-deploy
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-stache-deploy
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Checkout packages (stache repo)
-        uses: actions/checkout@v4
+      # Option B: IAM Access Keys (default)
+      - name: Configure AWS credentials (Access Keys)
+        if: ${{ !inputs.use_oidc }}
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          repository: stache-ai/stache-ai
-          path: stache-packages
-          sparse-checkout: packages
-          fetch-depth: 1
-          token: ${{ secrets.STACHE_REPO_TOKEN || github.token }}
-
-      - name: Build Lambda layer
-        run: |
-          mkdir -p layer/python
-          pip install \
-            stache-packages/packages/stache-ai \
-            stache-packages/packages/stache-ai-bedrock \
-            stache-packages/packages/stache-ai-s3vectors \
-            stache-packages/packages/stache-ai-dynamodb \
-            mangum \
-            -t layer/python --quiet
-
-          # Clean up unnecessary files to reduce layer size (keep stache_ai*.dist-info for entry points)
-          find layer/python -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-          find layer/python -type d -name "*.dist-info" ! -name "stache_ai*.dist-info" -exec rm -rf {} + 2>/dev/null || true
-          find layer/python -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
-
-      - name: Build SAM application
-        run: sam build
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Set resource names
         id: names
@@ -91,8 +132,54 @@ jobs:
           PREFIX="${{ inputs.resource_prefix }}"
           echo "prefix=$PREFIX" >> $GITHUB_OUTPUT
           echo "stack_name=${PREFIX}-serverless" >> $GITHUB_OUTPUT
+          echo "agentcore_stack=${PREFIX}-agentcore" >> $GITHUB_OUTPUT
+
+      # ============================================================
+      # MAIN STACK DEPLOYMENT (full, stack-only)
+      # ============================================================
+
+      - name: Build Lambda layer
+        if: ${{ inputs.action == 'full' || inputs.action == 'stack-only' }}
+        run: |
+          mkdir -p layer/python
+
+          if [ "${{ inputs.backend_source }}" = "build" ]; then
+            # Build from source (stache-frontend submodule)
+            if [ ! -d "stache-frontend/packages" ]; then
+              echo "::error::Stache source not found. Ensure submodules are checked out."
+              exit 1
+            fi
+            echo "Building backend from source..."
+            pip install \
+              stache-frontend/packages/stache-ai \
+              stache-frontend/packages/stache-ai-bedrock \
+              stache-frontend/packages/stache-ai-s3vectors \
+              stache-frontend/packages/stache-ai-dynamodb \
+              mangum \
+              -t layer/python --quiet
+          else
+            # Install from PyPI (default)
+            echo "Installing backend from PyPI..."
+            pip install \
+              stache-ai \
+              stache-ai-bedrock \
+              stache-ai-s3vectors \
+              stache-ai-dynamodb \
+              mangum \
+              -t layer/python --quiet
+          fi
+
+          # Clean up unnecessary files to reduce layer size (keep stache_ai*.dist-info for entry points)
+          find layer/python -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+          find layer/python -type d -name "*.dist-info" ! -name "stache_ai*.dist-info" -exec rm -rf {} + 2>/dev/null || true
+          find layer/python -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
+
+      - name: Build SAM application
+        if: ${{ inputs.action == 'full' || inputs.action == 'stack-only' }}
+        run: sam build
 
       - name: Get domain configuration
+        if: ${{ inputs.action == 'full' || inputs.action == 'stack-only' }}
         id: domain
         run: |
           STACK_NAME="${{ steps.names.outputs.stack_name }}"
@@ -104,24 +191,25 @@ jobs:
             echo "Looking for certificate for domain: $DOMAIN"
 
             CERT=$(aws acm list-certificates \
+              --region ${{ env.AWS_REGION }} \
               --query "CertificateSummaryList[?DomainName=='$DOMAIN'].CertificateArn | [0]" \
               --output text 2>/dev/null || echo "")
 
             if [ -z "$CERT" ] || [ "$CERT" = "None" ]; then
               echo "::error::No certificate found for domain: $DOMAIN"
-              echo "Create one with: ./scripts/setup-custom-domain.sh $DOMAIN"
+              echo "Create one with the Setup Custom Domain workflow first"
               exit 1
             fi
 
             # Verify certificate is validated
             CERT_STATUS=$(aws acm describe-certificate \
               --certificate-arn "$CERT" \
+              --region ${{ env.AWS_REGION }} \
               --query 'Certificate.Status' \
               --output text 2>/dev/null || echo "")
 
             if [ "$CERT_STATUS" != "ISSUED" ]; then
               echo "::error::Certificate for $DOMAIN is not validated (status: $CERT_STATUS)"
-              echo "Check status with: ./scripts/check-certificate.sh"
               exit 1
             fi
 
@@ -143,7 +231,8 @@ jobs:
           echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
           echo "cert=$CERT" >> $GITHUB_OUTPUT
 
-      - name: Deploy to AWS
+      - name: Deploy main stack
+        if: ${{ inputs.action == 'full' || inputs.action == 'stack-only' }}
         run: |
           STACK_NAME="${{ steps.names.outputs.stack_name }}"
           PREFIX="${{ steps.names.outputs.prefix }}"
@@ -168,6 +257,7 @@ jobs:
             --parameter-overrides $PARAMS
 
       - name: Get stack outputs
+        if: ${{ inputs.action == 'full' || inputs.action == 'stack-only' }}
         id: outputs
         run: |
           STACK_NAME="${{ steps.names.outputs.stack_name }}"
@@ -235,18 +325,43 @@ jobs:
             --output text 2>/dev/null || echo "")
           echo "cloudfront_domain=$CLOUDFRONT_DOMAIN" >> $GITHUB_OUTPUT
 
-      - name: Checkout frontend (stache repo)
-        uses: actions/checkout@v4
-        with:
-          repository: stache-ai/stache-ai
-          path: stache-frontend
-          sparse-checkout: frontend
-          fetch-depth: 1  # Shallow clone - only latest commit
-          # Uses GITHUB_TOKEN by default, or set STACHE_REPO_TOKEN secret for private repos
-          token: ${{ secrets.STACHE_REPO_TOKEN || github.token }}
+      - name: Download pre-built frontend
+        if: ${{ (inputs.action == 'full' || inputs.action == 'stack-only') && inputs.frontend_source != 'build' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SOURCE="${{ inputs.frontend_source }}"
+          PACKAGE="${{ inputs.frontend_package }}"
 
-      - name: Build frontend
-        working-directory: stache-frontend/frontend
+          # Configure npm for GitHub Packages
+          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" >> ~/.npmrc
+          echo "@stache-ai:registry=https://npm.pkg.github.com" >> ~/.npmrc
+
+          if [ "$SOURCE" = "latest" ] || [ -z "$SOURCE" ]; then
+            echo "Fetching latest version of ${PACKAGE}..."
+            VERSION=$(npm view "${PACKAGE}" version --registry=https://npm.pkg.github.com 2>/dev/null || echo "")
+
+            if [ -z "$VERSION" ]; then
+              echo "::error::Package ${PACKAGE} not found. Use frontend_source=build to build from source."
+              exit 1
+            fi
+          else
+            # Strip 'v' prefix if provided
+            VERSION=$(echo "$SOURCE" | sed 's/^v//')
+          fi
+
+          echo "Downloading ${PACKAGE}@${VERSION}"
+          mkdir -p stache-frontend/frontend
+
+          npm pack "${PACKAGE}@${VERSION}" --registry=https://npm.pkg.github.com
+          tar -xzf *.tgz
+          mv package/dist stache-frontend/frontend/
+          rm -rf package *.tgz
+
+          echo "Frontend $VERSION downloaded successfully"
+
+      - name: Build frontend from source
+        if: ${{ (inputs.action == 'full' || inputs.action == 'stack-only') && inputs.frontend_source == 'build' }}
         env:
           # Pass Cognito config to frontend build
           VITE_AUTH_PROVIDER: cognito
@@ -255,10 +370,37 @@ jobs:
           VITE_COGNITO_DOMAIN: ${{ steps.outputs.outputs.cognito_domain }}
           VITE_API_URL: ${{ steps.outputs.outputs.api_url }}
         run: |
-          npm ci
+          # Validate submodule exists
+          if [ ! -d "stache-frontend/frontend" ]; then
+            echo "::error::Frontend submodule not found. Ensure submodules are checked out."
+            exit 1
+          fi
+          cd stache-frontend/frontend
+          npm install
           npm run build
 
+      - name: Generate runtime config
+        if: ${{ inputs.action == 'full' || inputs.action == 'stack-only' }}
+        run: |
+          # Generate config.json for runtime configuration using jq for safe JSON escaping
+          # This allows pre-built npm packages to work with any deployment
+          jq -n \
+            --arg auth "cognito" \
+            --arg pool_id "${{ steps.outputs.outputs.user_pool_id }}" \
+            --arg client_id "${{ steps.outputs.outputs.user_pool_client_id }}" \
+            --arg domain "${{ steps.outputs.outputs.cognito_domain }}" \
+            --arg api_url "${{ steps.outputs.outputs.api_url }}" \
+            '{
+              AUTH_PROVIDER: $auth,
+              COGNITO_USER_POOL_ID: $pool_id,
+              COGNITO_CLIENT_ID: $client_id,
+              COGNITO_DOMAIN: $domain,
+              API_URL: $api_url
+            }' > stache-frontend/frontend/dist/config.json
+          echo "Generated config.json for runtime configuration"
+
       - name: Deploy frontend to S3
+        if: ${{ inputs.action == 'full' || inputs.action == 'stack-only' }}
         run: |
           aws s3 sync stache-frontend/frontend/dist s3://${{ steps.outputs.outputs.frontend_bucket }}/ \
             --delete \
@@ -266,59 +408,334 @@ jobs:
             --exclude "index.html" \
             --exclude "*.json"
 
-          # Upload index.html and JSON with no-cache for immediate updates
+          # Upload index.html with no-cache for immediate updates
           aws s3 cp stache-frontend/frontend/dist/index.html s3://${{ steps.outputs.outputs.frontend_bucket }}/index.html \
             --cache-control "no-cache,no-store,must-revalidate"
 
-          # Upload any JSON files (like config) with no-cache
-          find stache-frontend/frontend/dist -name "*.json" -exec aws s3 cp {} s3://${{ steps.outputs.outputs.frontend_bucket }}/ \
+          # Upload config.json with no-cache (runtime configuration)
+          aws s3 cp stache-frontend/frontend/dist/config.json s3://${{ steps.outputs.outputs.frontend_bucket }}/config.json \
+            --cache-control "no-cache,no-store,must-revalidate"
+
+          # Upload any other JSON files with no-cache
+          find stache-frontend/frontend/dist -name "*.json" ! -name "config.json" -exec aws s3 cp {} s3://${{ steps.outputs.outputs.frontend_bucket }}/ \
             --cache-control "no-cache,no-store,must-revalidate" \;
 
       - name: Invalidate CloudFront cache
+        if: ${{ inputs.action == 'full' || inputs.action == 'stack-only' }}
         run: |
           aws cloudfront create-invalidation \
             --distribution-id ${{ steps.outputs.outputs.cloudfront_id }} \
             --paths "/*"
 
-      - name: Deployment summary
+      # ============================================================
+      # AGENTCORE DEPLOYMENT (full, agentcore-only)
+      # ============================================================
+
+      - name: Check main stack exists (for AgentCore)
+        if: ${{ inputs.action == 'full' || inputs.action == 'agentcore-only' }}
         run: |
+          STACK_NAME="${{ steps.names.outputs.stack_name }}"
+
+          STATUS=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].StackStatus' \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [ "$STATUS" = "NOT_FOUND" ]; then
+            echo "::error::Main stack '$STACK_NAME' not found"
+            echo "Deploy the main stack first (action: stack-only or full)"
+            exit 1
+          fi
+
+          echo "Found main stack: $STACK_NAME (status: $STATUS)"
+
+      - name: Deploy AgentCore stack
+        if: ${{ inputs.action == 'full' || inputs.action == 'agentcore-only' }}
+        run: |
+          STACK_NAME="${{ steps.names.outputs.stack_name }}"
+          AGENTCORE_STACK="${{ steps.names.outputs.agentcore_stack }}"
+          PREFIX="${{ steps.names.outputs.prefix }}"
+
+          echo "Deploying AgentCore CloudFormation stack: $AGENTCORE_STACK"
+
+          aws cloudformation deploy \
+            --stack-name "$AGENTCORE_STACK" \
+            --template-file agentcore-template.yaml \
+            --parameter-overrides \
+                "ResourcePrefix=$PREFIX" \
+                "MainStackName=$STACK_NAME" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --region "${{ env.AWS_REGION }}" \
+            --no-fail-on-empty-changeset
+
+          echo "AgentCore stack deployed successfully"
+
+      - name: Get AgentCore outputs
+        if: ${{ inputs.action == 'full' || inputs.action == 'agentcore-only' }}
+        id: agentcore
+        run: |
+          AGENTCORE_STACK="${{ steps.names.outputs.agentcore_stack }}"
+
+          get_output() {
+            aws cloudformation describe-stacks \
+              --stack-name "$AGENTCORE_STACK" \
+              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" \
+              --output text
+          }
+
+          GATEWAY_URL=$(get_output "GatewayUrl")
+          GATEWAY_ID=$(get_output "GatewayId")
+          TARGET_ID=$(get_output "TargetId")
+          MCP_CLIENT_ID=$(get_output "MCPClientId")
+          USER_POOL_ID=$(get_output "UserPoolId")
+          USER_POOL_DOMAIN=$(get_output "UserPoolDomain")
+          LAMBDA_ARN=$(get_output "LambdaArn")
+
+          # Get MCP client secret
+          MCP_CLIENT_SECRET=$(aws cognito-idp describe-user-pool-client \
+            --user-pool-id "$USER_POOL_ID" \
+            --client-id "$MCP_CLIENT_ID" \
+            --query 'UserPoolClient.ClientSecret' \
+            --output text 2>/dev/null || echo "")
+
+          echo "gateway_url=$GATEWAY_URL" >> $GITHUB_OUTPUT
+          echo "gateway_id=$GATEWAY_ID" >> $GITHUB_OUTPUT
+          echo "target_id=$TARGET_ID" >> $GITHUB_OUTPUT
+          echo "mcp_client_id=$MCP_CLIENT_ID" >> $GITHUB_OUTPUT
+          echo "user_pool_id=$USER_POOL_ID" >> $GITHUB_OUTPUT
+          echo "user_pool_domain=$USER_POOL_DOMAIN" >> $GITHUB_OUTPUT
+          echo "lambda_arn=$LAMBDA_ARN" >> $GITHUB_OUTPUT
+          echo "mcp_client_secret=$MCP_CLIENT_SECRET" >> $GITHUB_OUTPUT
+
+      # ============================================================
+      # CREATE USER (full with email, user-only)
+      # ============================================================
+
+      - name: Get User Pool ID (for user creation)
+        if: ${{ (inputs.action == 'user-only') || (inputs.action == 'full' && inputs.user_email != '') }}
+        id: user_pool
+        run: |
+          STACK_NAME="${{ steps.names.outputs.stack_name }}"
+
+          USER_POOL_ID=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`UserPoolId`].OutputValue' \
+            --output text)
+
+          if [ -z "$USER_POOL_ID" ] || [ "$USER_POOL_ID" = "None" ]; then
+            echo "::error::Could not find User Pool ID. Is the stack deployed?"
+            exit 1
+          fi
+
+          echo "user_pool_id=$USER_POOL_ID" >> $GITHUB_OUTPUT
+
+          FRONTEND_URL=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`FrontendUrl`].OutputValue' \
+            --output text)
+          echo "frontend_url=$FRONTEND_URL" >> $GITHUB_OUTPUT
+
+      - name: Validate email provided
+        if: ${{ inputs.action == 'user-only' && inputs.user_email == '' }}
+        run: |
+          echo "::error::Email is required for user-only action"
+          exit 1
+
+      - name: Create Cognito user
+        if: ${{ (inputs.action == 'user-only' && inputs.user_email != '') || (inputs.action == 'full' && inputs.user_email != '') }}
+        run: |
+          USER_POOL_ID="${{ steps.user_pool.outputs.user_pool_id || steps.outputs.outputs.user_pool_id }}"
+          EMAIL="${{ inputs.user_email }}"
+
+          # Cognito will email the temporary password
+          aws cognito-idp admin-create-user \
+            --user-pool-id "$USER_POOL_ID" \
+            --username "$EMAIL" \
+            --user-attributes Name=email,Value="$EMAIL" Name=email_verified,Value=true \
+            --region ${{ env.AWS_REGION }} \
+            --output text > /dev/null
+
+          echo "User created: $EMAIL"
+          echo "A temporary password has been emailed to the user."
+
+      # ============================================================
+      # SUMMARY
+      # ============================================================
+
+      # ============================================================
+      # DELETE STACKS (delete)
+      # ============================================================
+
+      - name: Delete AgentCore stack
+        if: ${{ inputs.action == 'delete' }}
+        run: |
+          AGENTCORE_STACK="${{ steps.names.outputs.agentcore_stack }}"
+
+          # Check if AgentCore stack exists
+          STATUS=$(aws cloudformation describe-stacks \
+            --stack-name "$AGENTCORE_STACK" \
+            --query 'Stacks[0].StackStatus' \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [ "$STATUS" != "NOT_FOUND" ]; then
+            echo "Deleting AgentCore stack: $AGENTCORE_STACK"
+            aws cloudformation delete-stack --stack-name "$AGENTCORE_STACK"
+            echo "Waiting for AgentCore stack deletion..."
+            aws cloudformation wait stack-delete-complete --stack-name "$AGENTCORE_STACK"
+            echo "AgentCore stack deleted"
+          else
+            echo "AgentCore stack not found, skipping"
+          fi
+
+      - name: Empty S3 buckets before deletion
+        if: ${{ inputs.action == 'delete' }}
+        run: |
+          STACK_NAME="${{ steps.names.outputs.stack_name }}"
+
+          # Check if main stack exists
+          STATUS=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].StackStatus' \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [ "$STATUS" = "NOT_FOUND" ]; then
+            echo "Main stack not found, nothing to delete"
+            exit 0
+          fi
+
+          # Get bucket names from stack outputs
+          FRONTEND_BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[?OutputKey==`FrontendBucketName`].OutputValue' \
+            --output text 2>/dev/null || echo "")
+
+          # Empty frontend bucket if it exists
+          if [ -n "$FRONTEND_BUCKET" ] && [ "$FRONTEND_BUCKET" != "None" ]; then
+            echo "Emptying frontend bucket: $FRONTEND_BUCKET"
+            aws s3 rm "s3://$FRONTEND_BUCKET" --recursive || true
+          fi
+
+      - name: Delete main stack
+        if: ${{ inputs.action == 'delete' }}
+        run: |
+          STACK_NAME="${{ steps.names.outputs.stack_name }}"
+
+          # Check if main stack exists
+          STATUS=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].StackStatus' \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [ "$STATUS" != "NOT_FOUND" ]; then
+            echo "Deleting main stack: $STACK_NAME"
+            aws cloudformation delete-stack --stack-name "$STACK_NAME"
+            echo "Waiting for main stack deletion (this may take several minutes)..."
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+            echo "Main stack deleted"
+          else
+            echo "Main stack not found, nothing to delete"
+          fi
+
+      # ============================================================
+      # SUMMARY
+      # ============================================================
+
+      - name: Deployment summary
+        if: ${{ inputs.action != 'delete' }}
+        run: |
+          ACTION="${{ inputs.action }}"
+
           echo "## Deployment Complete ✓" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-
-          # Show the app URL (frontend URL from CloudFront or custom domain)
-          echo "### 🌐 Your App" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**${{ steps.outputs.outputs.frontend_url }}**" >> $GITHUB_STEP_SUMMARY
+          echo "**Action:** \`$ACTION\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          # Show custom domain setup instructions if domain is configured
-          APP_DOMAIN="${{ steps.outputs.outputs.app_domain }}"
-          CLOUDFRONT_DOMAIN="${{ steps.outputs.outputs.cloudfront_domain }}"
-          if [ -n "$APP_DOMAIN" ] && [ "$APP_DOMAIN" != "None" ] && [ -n "$CLOUDFRONT_DOMAIN" ]; then
-            echo "### 🔗 Custom Domain Setup" >> $GITHUB_STEP_SUMMARY
+          # Stack deployment summary
+          if [ "$ACTION" = "full" ] || [ "$ACTION" = "stack-only" ]; then
+            echo "### 🌐 Application" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Add this CNAME record to your DNS:" >> $GITHUB_STEP_SUMMARY
+            echo "**Frontend:** ${{ steps.outputs.outputs.frontend_url }}" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "| Type | Name | Value |" >> $GITHUB_STEP_SUMMARY
-            echo "|------|------|-------|" >> $GITHUB_STEP_SUMMARY
-            echo "| CNAME | \`$APP_DOMAIN\` | \`$CLOUDFRONT_DOMAIN\` |" >> $GITHUB_STEP_SUMMARY
+
+            # Show custom domain setup instructions if domain is configured
+            APP_DOMAIN="${{ steps.outputs.outputs.app_domain }}"
+            CLOUDFRONT_DOMAIN="${{ steps.outputs.outputs.cloudfront_domain }}"
+            if [ -n "$APP_DOMAIN" ] && [ "$APP_DOMAIN" != "None" ] && [ -n "$CLOUDFRONT_DOMAIN" ]; then
+              echo "#### Custom Domain Setup" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "Add this CNAME record to your DNS:" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "| Type | Name | Value |" >> $GITHUB_STEP_SUMMARY
+              echo "|------|------|-------|" >> $GITHUB_STEP_SUMMARY
+              echo "| CNAME | \`$APP_DOMAIN\` | \`$CLOUDFRONT_DOMAIN\` |" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+
+            echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Stack Name | \`${{ steps.names.outputs.stack_name }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| API Gateway | ${{ steps.outputs.outputs.api_url }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| CloudFront ID | \`${{ steps.outputs.outputs.cloudfront_id }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| S3 Bucket | \`${{ steps.outputs.outputs.frontend_bucket }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| User Pool ID | \`${{ steps.outputs.outputs.user_pool_id }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| Client ID | \`${{ steps.outputs.outputs.user_pool_client_id }}\` |" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
 
-          echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          # AgentCore summary
+          if [ "$ACTION" = "full" ] || [ "$ACTION" = "agentcore-only" ]; then
+            echo "### 🤖 AgentCore Gateway (Claude Web MCP)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Add this MCP server in [Claude Web settings](https://claude.ai/settings/mcp):" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Name | Stache |" >> $GITHUB_STEP_SUMMARY
+            echo "| URL | \`${{ steps.agentcore.outputs.gateway_url }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| Client ID | \`${{ steps.agentcore.outputs.mcp_client_id }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| Client Secret | \`${{ steps.agentcore.outputs.mcp_client_secret }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
 
-          echo "### Stack Details" >> $GITHUB_STEP_SUMMARY
+          # User creation summary
+          USER_EMAIL="${{ inputs.user_email }}"
+          if [ -n "$USER_EMAIL" ]; then
+            echo "### 👤 User Created" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Email:** $USER_EMAIL" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "A temporary password has been emailed. User will be prompted to change it on first login." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Console output for act/local visibility
+          echo ""
+          echo "=== Deployment Complete ==="
+          echo "Action: $ACTION"
+          if [ "$ACTION" = "full" ] || [ "$ACTION" = "stack-only" ]; then
+            echo "Frontend: ${{ steps.outputs.outputs.frontend_url }}"
+          fi
+          if [ "$ACTION" = "full" ] || [ "$ACTION" = "agentcore-only" ]; then
+            echo "AgentCore Gateway: ${{ steps.agentcore.outputs.gateway_url }}"
+          fi
+
+      - name: Delete summary
+        if: ${{ inputs.action == 'delete' }}
+        run: |
+          echo "## Stacks Deleted ✓" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Resource Prefix | \`${{ steps.names.outputs.prefix }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Stack Name | \`${{ steps.names.outputs.stack_name }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Region | \`${{ env.AWS_REGION }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Frontend URL | ${{ steps.outputs.outputs.frontend_url }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| API Gateway | ${{ steps.outputs.outputs.api_url }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| CloudFront ID | \`${{ steps.outputs.outputs.cloudfront_id }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| CloudFront Domain | \`${{ steps.outputs.outputs.cloudfront_domain }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| S3 Bucket | \`${{ steps.outputs.outputs.frontend_bucket }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| User Pool ID | \`${{ steps.outputs.outputs.user_pool_id }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Client ID | \`${{ steps.outputs.outputs.user_pool_client_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "**Prefix:** \`${{ steps.names.outputs.prefix }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "The following stacks have been deleted:" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ steps.names.outputs.agentcore_stack }}\` (AgentCore)" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ steps.names.outputs.stack_name }}\` (Main)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **Note:** S3 Vectors data and DynamoDB tables are retained by default." >> $GITHUB_STEP_SUMMARY
+          echo "Delete them manually if no longer needed." >> $GITHUB_STEP_SUMMARY
+
+          # Console output
+          echo ""
+          echo "=== Stacks Deleted ==="
+          echo "Prefix: ${{ steps.names.outputs.prefix }}"

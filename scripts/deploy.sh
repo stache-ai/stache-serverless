@@ -179,6 +179,7 @@ if [[ "$SKIP_BACKEND" == false ]]; then
                 "$FROM_SOURCE/packages/stache-ai-bedrock" \
                 "$FROM_SOURCE/packages/stache-ai-s3vectors" \
                 "$FROM_SOURCE/packages/stache-ai-dynamodb" \
+                "$FROM_SOURCE/packages/stache-ai-documents" \
                 mangum \
                 -t "$PROJECT_DIR/layer/python" --quiet
         else
@@ -188,6 +189,7 @@ if [[ "$SKIP_BACKEND" == false ]]; then
                 stache-ai-bedrock \
                 stache-ai-s3vectors \
                 stache-ai-dynamodb \
+                stache-ai-documents \
                 mangum \
                 -t "$PROJECT_DIR/layer/python" --quiet
         fi
@@ -232,15 +234,33 @@ get_frontend_config
 
 # Build and deploy frontend
 if [[ "$SKIP_FRONTEND" == false ]]; then
-    # Determine frontend source
-    FRONTEND_SOURCE="${FROM_SOURCE:-../stache}"
+    # Find frontend source (priority order)
+    FRONTEND_DIR=""
 
-    # Resolve to absolute path before cd
-    FRONTEND_DIR="$(cd "$FRONTEND_SOURCE/frontend" 2>/dev/null && pwd)"
-    if [[ -z "$FRONTEND_DIR" ]] || [[ ! -d "$FRONTEND_DIR" ]]; then
-        print_error "Frontend not found at $FRONTEND_SOURCE/frontend"
+    if [[ -n "$FROM_SOURCE" ]]; then
+        # Explicit --from-source takes priority
+        FRONTEND_DIR="$(cd "$FROM_SOURCE/frontend" 2>/dev/null && pwd)"
+    fi
+
+    if [[ -z "$FRONTEND_DIR" ]] && [[ -d "$PROJECT_DIR/stache-frontend/frontend" ]]; then
+        # Submodule
+        FRONTEND_DIR="$(cd "$PROJECT_DIR/stache-frontend/frontend" && pwd)"
+    fi
+
+    if [[ -z "$FRONTEND_DIR" ]] && [[ -d "$PROJECT_DIR/../stache/frontend" ]]; then
+        # Sibling directory
+        FRONTEND_DIR="$(cd "$PROJECT_DIR/../stache/frontend" && pwd)"
+    fi
+
+    if [[ -z "$FRONTEND_DIR" ]]; then
+        print_error "Frontend not found. Checked:"
+        echo "  - $PROJECT_DIR/stache-frontend/frontend (submodule)"
+        echo "  - $PROJECT_DIR/../stache/frontend (sibling dir)"
+        echo "Use --from-source <path> to specify stache repo, or --skip-frontend"
         exit 1
     fi
+
+    echo "Using frontend from: $FRONTEND_DIR"
 
     print_header "Building frontend"
     cd "$FRONTEND_DIR"

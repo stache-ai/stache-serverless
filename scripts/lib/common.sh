@@ -226,6 +226,23 @@ deploy_frontend() {
 
     print_header "Deploying frontend to S3"
 
+    # Generate runtime config.json for pre-built packages using jq for safe JSON escaping
+    # This allows npm packages to work with any deployment
+    jq -n \
+        --arg auth "cognito" \
+        --arg pool_id "$USER_POOL_ID" \
+        --arg client_id "$USER_POOL_CLIENT_ID" \
+        --arg domain "$COGNITO_DOMAIN" \
+        --arg api_url "$API_URL" \
+        '{
+          AUTH_PROVIDER: $auth,
+          COGNITO_USER_POOL_ID: $pool_id,
+          COGNITO_CLIENT_ID: $client_id,
+          COGNITO_DOMAIN: $domain,
+          API_URL: $api_url
+        }' > "$frontend_dir/config.json"
+    print_success "Generated runtime config.json"
+
     # Sync with cache headers
     aws s3 sync "$frontend_dir" "s3://$FRONTEND_BUCKET/" \
         --delete \
@@ -237,8 +254,12 @@ deploy_frontend() {
     aws s3 cp "$frontend_dir/index.html" "s3://$FRONTEND_BUCKET/index.html" \
         --cache-control "no-cache,no-store,must-revalidate"
 
-    # Upload JSON files with no-cache
-    find "$frontend_dir" -name "*.json" -exec aws s3 cp {} "s3://$FRONTEND_BUCKET/" \
+    # Upload config.json with no-cache (runtime configuration)
+    aws s3 cp "$frontend_dir/config.json" "s3://$FRONTEND_BUCKET/config.json" \
+        --cache-control "no-cache,no-store,must-revalidate"
+
+    # Upload any other JSON files with no-cache
+    find "$frontend_dir" -name "*.json" ! -name "config.json" -exec aws s3 cp {} "s3://$FRONTEND_BUCKET/" \
         --cache-control "no-cache,no-store,must-revalidate" \;
 
     print_success "Frontend deployed to S3"
@@ -352,7 +373,6 @@ print_deploy_summary() {
     fi
     echo "  S3 Bucket:      $FRONTEND_BUCKET"
     echo "  User Pool ID:   $USER_POOL_ID"
-    echo "  Client ID:      $USER_POOL_CLIENT_ID"
 
     # stache-tools configuration
     if [[ -n "${API_FUNCTION_NAME:-}" ]]; then

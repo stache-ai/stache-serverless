@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: GitHub Actions OIDC Provider and IAM Role for Stache deployment
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: GitHub organization or username (e.g., stache-ai)
+
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name (e.g., stache-serverless)
+
+  OIDCProviderArn:
+    Type: String
+    Default: ''
+    Description: Existing OIDC Provider ARN (leave empty to create new)
+
+Conditions:
+  CreateOIDCProvider: !Equals [!Ref OIDCProviderArn, '']
+
+Resources:
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  # Policy 1: Scoped resources (stache-* naming convention)
+  ScopedResourcesPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: github-actions-stache-scoped
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudFormation
+            Effect: Allow
+            Action: cloudformation:*
+            Resource:
+              - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/*-serverless/*
+              - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/*-agentcore/*
+              - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/*-certificate/*
+              - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/aws-sam-cli-managed-default/*
+              - !Sub arn:aws:cloudformation:${AWS::Region}:aws:transform/*
+          - Sid: S3
+            Effect: Allow
+            Action: s3:*
+            Resource:
+              - arn:aws:s3:::aws-sam-cli-managed-default-*
+              - arn:aws:s3:::aws-sam-cli-managed-default-*/*
+              - arn:aws:s3:::*-frontend-*
+              - arn:aws:s3:::*-frontend-*/*
+              - arn:aws:s3:::*-vectors-*
+          - Sid: Lambda
+            Effect: Allow
+            Action: lambda:*
+            Resource:
+              - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*-api
+              - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*-agentcore
+              - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:*
+          - Sid: DynamoDB
+            Effect: Allow
+            Action: dynamodb:*
+            Resource:
+              - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/*-namespaces
+              - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/*-documents
+          - Sid: Cognito
+            Effect: Allow
+            Action: cognito-idp:*
+            Resource:
+              - !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*
+          - Sid: IAM
+            Effect: Allow
+            Action:
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:GetRole
+              - iam:PassRole
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:GetRolePolicy
+              - iam:TagRole
+              - iam:UntagRole
+              - iam:CreatePolicy
+              - iam:DeletePolicy
+              - iam:GetPolicy
+              - iam:GetPolicyVersion
+            Resource:
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/*-serverless-*
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/*-agentcore-*
+              - !Sub arn:aws:iam::${AWS::AccountId}:policy/*-serverless-*
+          - Sid: SQS
+            Effect: Allow
+            Action: sqs:*
+            Resource:
+              - !Sub arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:*-lambda-dlq
+          - Sid: Logs
+            Effect: Allow
+            Action: logs:*
+            Resource:
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*-api:*
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*-agentcore:*
+          - Sid: CloudWatch
+            Effect: Allow
+            Action: cloudwatch:*
+            Resource:
+              - !Sub arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:*-serverless-*
+              - !Sub arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:*-api-*
+              - !Sub arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:*-agentcore-*
+
+  # Policy 2: Global resources (no resource-level restrictions possible)
+  GlobalResourcesPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: github-actions-stache-global
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: APIGateway
+            Effect: Allow
+            Action: apigateway:*
+            Resource:
+              - !Sub arn:aws:apigateway:${AWS::Region}::/restapis
+              - !Sub arn:aws:apigateway:${AWS::Region}::/restapis/*
+              - !Sub arn:aws:apigateway:${AWS::Region}::/apis
+              - !Sub arn:aws:apigateway:${AWS::Region}::/apis/*
+              - !Sub arn:aws:apigateway:${AWS::Region}::/v2/apis
+              - !Sub arn:aws:apigateway:${AWS::Region}::/v2/apis/*
+              - !Sub arn:aws:apigateway:${AWS::Region}::/tags/*
+          - Sid: CloudFront
+            Effect: Allow
+            Action: cloudfront:*
+            Resource: '*'
+          - Sid: ACM
+            Effect: Allow
+            Action: acm:*
+            Resource: '*'
+          - Sid: S3Vectors
+            Effect: Allow
+            Action: s3vectors:*
+            Resource: '*'
+          - Sid: BedrockAgentCore
+            Effect: Allow
+            Action: bedrock-agentcore:*
+            Resource: '*'
+
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: github-actions-stache-deploy
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateOIDCProvider
+                - !GetAtt GitHubOIDCProvider.Arn
+                - !Ref OIDCProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubRepo}:*
+      ManagedPolicyArns:
+        - !Ref ScopedResourcesPolicy
+        - !Ref GlobalResourcesPolicy
+
+Outputs:
+  RoleArn:
+    Value: !GetAtt GitHubActionsRole.Arn
+  OIDCProviderArn:
+    Value: !If [CreateOIDCProvider, !GetAtt GitHubOIDCProvider.Arn, !Ref OIDCProviderArn]

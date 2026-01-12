@@ -12,6 +12,11 @@ on:
         description: 'Custom domain (e.g., stache.example.com)'
         required: true
         type: string
+      use_oidc:
+        description: 'Use OIDC authentication'
+        required: false
+        type: boolean
+        default: false
 
 env:
   AWS_REGION: us-east-1
@@ -28,12 +33,164 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Install AWS CLI
+        run: |
+          if ! command -v aws &> /dev/null; then
+            curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+            rm -rf aws awscliv2.zip
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ inputs.use_oidc }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-stache-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure AWS credentials (Access Keys)
+        if: ${{ !inputs.use_oidc }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Run setup script
-        run: ./scripts/setup-custom-domain.sh --prefix "${{ inputs.resource_prefix }}" "${{ inputs.domain }}"
+      - name: Check for existing certificate
+        id: cert
+        run: |
+          DOMAIN="${{ inputs.domain }}"
+
+          # Check if certificate already exists
+          CERT_ARN=$(aws acm list-certificates \
+            --region ${{ env.AWS_REGION }} \
+            --query "CertificateSummaryList[?DomainName=='$DOMAIN'].CertificateArn | [0]" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$CERT_ARN" ] && [ "$CERT_ARN" != "None" ]; then
+            echo "cert_arn=$CERT_ARN" >> $GITHUB_OUTPUT
+            echo "exists=true" >> $GITHUB_OUTPUT
+
+            CERT_STATUS=$(aws acm describe-certificate \
+              --certificate-arn "$CERT_ARN" \
+              --region ${{ env.AWS_REGION }} \
+              --query 'Certificate.Status' \
+              --output text)
+            echo "status=$CERT_STATUS" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Request new certificate
+        if: steps.cert.outputs.exists != 'true'
+        id: new_cert
+        run: |
+          DOMAIN="${{ inputs.domain }}"
+
+          CERT_ARN=$(aws acm request-certificate \
+            --domain-name "$DOMAIN" \
+            --validation-method DNS \
+            --region ${{ env.AWS_REGION }} \
+            --tags Key=Name,Value="$DOMAIN" Key=Project,Value="${{ inputs.resource_prefix }}" \
+            --query 'CertificateArn' \
+            --output text)
+
+          echo "cert_arn=$CERT_ARN" >> $GITHUB_OUTPUT
+          echo "Certificate requested: $CERT_ARN"
+
+          # Wait for validation records
+          sleep 5
+
+      - name: Get DNS validation records
+        id: validation
+        run: |
+          CERT_ARN="${{ steps.cert.outputs.cert_arn || steps.new_cert.outputs.cert_arn }}"
+          STATUS="${{ steps.cert.outputs.status }}"
+
+          # If already issued, no need to get validation records
+          if [ "$STATUS" = "ISSUED" ]; then
+            echo "Certificate already validated!"
+            echo "cert_arn=$CERT_ARN"
+            exit 0
+          fi
+
+          # Poll for validation records
+          for i in {1..6}; do
+            VALIDATION=$(aws acm describe-certificate \
+              --certificate-arn "$CERT_ARN" \
+              --region ${{ env.AWS_REGION }} \
+              --query 'Certificate.DomainValidationOptions[0].ResourceRecord' \
+              --output json 2>/dev/null || echo "null")
+
+            if [ "$VALIDATION" != "null" ] && [ -n "$VALIDATION" ]; then
+              CNAME_NAME=$(echo "$VALIDATION" | jq -r '.Name')
+              CNAME_VALUE=$(echo "$VALIDATION" | jq -r '.Value')
+              echo "cname_name=$CNAME_NAME" >> $GITHUB_OUTPUT
+              echo "cname_value=$CNAME_VALUE" >> $GITHUB_OUTPUT
+
+              # Print to console for act/local visibility
+              echo ""
+              echo "================================================"
+              echo "DNS VALIDATION RECORD"
+              echo "================================================"
+              echo ""
+              echo "Add this CNAME record to your DNS:"
+              echo ""
+              echo "  Type:  CNAME"
+              echo "  Name:  $CNAME_NAME"
+              echo "  Value: $CNAME_VALUE"
+              echo ""
+              echo "================================================"
+              echo ""
+              echo "Certificate ARN: $CERT_ARN"
+              echo "Domain: ${{ inputs.domain }}"
+              echo ""
+              echo "Next steps:"
+              echo "  1. Add the DNS record above"
+              echo "  2. Wait for validation (5-30 minutes)"
+              echo "  3. Deploy: Run the Deploy workflow with domain=${{ inputs.domain }}"
+              echo ""
+              break
+            fi
+
+            echo "Waiting for validation records... (attempt $i/6)"
+            sleep 5
+          done
+
+      - name: Summary
+        run: |
+          CERT_ARN="${{ steps.cert.outputs.cert_arn || steps.new_cert.outputs.cert_arn }}"
+          STATUS="${{ steps.cert.outputs.status }}"
+
+          echo "## Custom Domain Setup" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$STATUS" = "ISSUED" ]; then
+            echo "### Certificate Already Validated" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Your certificate is ready to use." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Deploy with: \`./scripts/deploy.sh --domain ${{ inputs.domain }}\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### DNS Validation Required" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Add this CNAME record to your DNS:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Type | Name | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|------|------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| CNAME | \`${{ steps.validation.outputs.cname_name }}\` | \`${{ steps.validation.outputs.cname_value }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "1. Add the DNS validation record above" >> $GITHUB_STEP_SUMMARY
+            echo "2. Wait for certificate validation (usually 5-30 minutes)" >> $GITHUB_STEP_SUMMARY
+            echo "3. Run the Deploy workflow with domain: \`${{ inputs.domain }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Certificate ARN:** \`$CERT_ARN\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Domain:** \`${{ inputs.domain }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Region:** \`${{ env.AWS_REGION }}\`" >> $GITHUB_STEP_SUMMARY

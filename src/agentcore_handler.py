@@ -85,6 +85,59 @@ def _validate_integer(value, name, required=True, min_val=None, max_val=None):
     return value
 
 
+def _validate_dict(value, name, required=False, request_id=None):
+    """Validate a dict parameter.
+
+    Args:
+        value: The value to validate
+        name: Parameter name for error messages
+        required: Whether the parameter is required
+        request_id: Request ID for logging context
+
+    Returns:
+        Validated dict, or None if not required and not provided
+    """
+    if value is None:
+        if required:
+            raise ValueError(f"{name} is required")
+        return None
+
+    if not isinstance(value, dict):
+        logger.warning(f"[{request_id}] Invalid {name}: expected dict, got {type(value).__name__}, ignoring")
+        return None
+
+    return value
+
+
+def _validate_string_list(value, name, max_items=20, max_item_length=100, request_id=None):
+    """Validate a list of strings parameter.
+
+    Args:
+        value: The value to validate
+        name: Parameter name for error messages
+        max_items: Maximum number of items allowed
+        max_item_length: Maximum length per item
+        request_id: Request ID for logging context
+
+    Returns:
+        Validated list of strings, or None if not provided/invalid
+    """
+    if value is None:
+        return None
+
+    if not isinstance(value, list):
+        logger.warning(f"[{request_id}] Invalid {name}: expected list, got {type(value).__name__}, ignoring")
+        return None
+
+    # Filter to valid strings and enforce limits
+    result = []
+    for item in value[:max_items]:
+        if isinstance(item, str) and item.strip():
+            result.append(item.strip()[:max_item_length])
+
+    return result if result else None
+
+
 def _get_agentcore_context(context):
     """Extract AgentCore metadata from Lambda context.
 
@@ -143,23 +196,34 @@ def _handle_agentcore_tool(custom: dict, params: dict) -> dict:
         if tool_name == 'search':
             query = _validate_string(params.get('query'), 'query', required=True, max_length=10000)
             namespace = _validate_string(params.get('namespace'), 'namespace', required=False, max_length=100)
-            top_k = _validate_integer(params.get('top_k', 20), 'top_k', required=False, min_val=1, max_val=100)
+            top_k = _validate_integer(params.get('top_k', 20), 'top_k', required=False, min_val=1, max_val=50)
+            filter_param = _validate_dict(params.get('filter'), 'filter', request_id=request_id)
             return do_search(
                 query=query,
                 namespace=namespace,
                 top_k=top_k,
                 rerank=params.get('rerank', True),
-                filter=params.get('filter'),
+                filter=filter_param,
                 request_id=request_id
             )
 
         elif tool_name == 'ingest_text':
             text = _validate_string(params.get('text'), 'text', required=True, max_length=100000)
             namespace = _validate_string(params.get('namespace'), 'namespace', required=False, max_length=100)
+            metadata = _validate_dict(params.get('metadata'), 'metadata', request_id=request_id)
+            prepend_metadata = _validate_string_list(params.get('prepend_metadata'), 'prepend_metadata', request_id=request_id)
+            chunking_strategy = params.get('chunking_strategy', 'recursive')
+            # Validate chunking_strategy
+            valid_strategies = ['recursive', 'markdown', 'semantic', 'character']
+            if chunking_strategy not in valid_strategies:
+                logger.warning(f"[{request_id}] Invalid chunking_strategy '{chunking_strategy}', using 'recursive'")
+                chunking_strategy = 'recursive'
             return do_ingest_text(
                 text=text,
-                metadata=params.get('metadata'),
+                metadata=metadata,
                 namespace=namespace,
+                chunking_strategy=chunking_strategy,
+                prepend_metadata=prepend_metadata,
                 request_id=request_id
             )
 
@@ -198,13 +262,16 @@ def _handle_agentcore_tool(custom: dict, params: dict) -> dict:
             ns_id = _validate_string(params.get('id'), 'id', required=True, max_length=200)
             name = _validate_string(params.get('name'), 'name', required=True, max_length=200)
             description = _validate_string(params.get('description', ''), 'description', required=False, max_length=1000)
+            parent_id = _validate_string(params.get('parent_id'), 'parent_id', required=False, max_length=200)
+            metadata = _validate_dict(params.get('metadata'), 'metadata', request_id=request_id)
+            filter_keys = _validate_string_list(params.get('filter_keys'), 'filter_keys', request_id=request_id)
             return do_create_namespace(
                 id=ns_id,
                 name=name,
                 description=description or '',
-                parent_id=params.get('parent_id'),
-                metadata=params.get('metadata'),
-                filter_keys=params.get('filter_keys'),
+                parent_id=parent_id,
+                metadata=metadata,
+                filter_keys=filter_keys,
                 request_id=request_id
             )
 
@@ -219,11 +286,12 @@ def _handle_agentcore_tool(custom: dict, params: dict) -> dict:
             ns_id = _validate_string(params.get('id'), 'id', required=True, max_length=200)
             name = _validate_string(params.get('name'), 'name', required=False, max_length=200)
             description = _validate_string(params.get('description'), 'description', required=False, max_length=1000)
+            metadata = _validate_dict(params.get('metadata'), 'metadata', request_id=request_id)
             return do_update_namespace(
                 id=ns_id,
                 name=name,
                 description=description,
-                metadata=params.get('metadata'),
+                metadata=metadata,
                 request_id=request_id
             )
 
@@ -247,7 +315,7 @@ def _handle_agentcore_tool(custom: dict, params: dict) -> dict:
         logger.warning(f"[{request_id}] Validation error in {tool_name}: {e}")
         msg = str(e)
         # Extra safety: check message doesn't contain sensitive patterns
-        if len(msg) < 200 and not any(x in msg.lower() for x in ['path', 'file', 'config', 'key', 'secret', 'token', 'arn:', 'aws:']):
+        if len(msg) < 200 and not any(x in msg.lower() for x in ['path', 'file', 'config', 'key', 'secret', 'token', 'arn:', 'aws:', 'password', 'credential', 'endpoint']):
             error_message = msg
         else:
             error_message = "Invalid input parameters"

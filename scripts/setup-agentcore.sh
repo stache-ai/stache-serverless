@@ -7,6 +7,7 @@ set -e
 # This script deploys agentcore-template.yaml which creates:
 #   - MCP Resource Server (Cognito scopes)
 #   - MCP OAuth Client (for Claude Web)
+#   - OAuth metadata API (for MCP discovery)
 #   - IAM Role and Lambda Permission
 #   - AgentCore Gateway with Cognito JWT auth
 #   - Lambda Target with tool schema
@@ -81,11 +82,23 @@ sleep 3
 # Tail stack events while deploy runs
 echo ""
 echo "Stack events:"
+
+# Portable date function (GNU vs BSD/macOS)
+get_date_30s_ago() {
+    if date --version >/dev/null 2>&1; then
+        # GNU date
+        date -u -d '30 seconds ago' '+%Y-%m-%dT%H:%M:%S'
+    else
+        # BSD date (macOS)
+        date -u -v-30S '+%Y-%m-%dT%H:%M:%S'
+    fi
+}
+
 while kill -0 $DEPLOY_PID 2>/dev/null; do
     aws cloudformation describe-stack-events \
         --stack-name "$AGENTCORE_STACK" \
         --region "$AWS_REGION" \
-        --query 'StackEvents[?Timestamp>=`'"$(date -u -d '30 seconds ago' '+%Y-%m-%dT%H:%M:%S')"'`].[Timestamp,LogicalResourceId,ResourceStatus]' \
+        --query 'StackEvents[?Timestamp>=`'"$(get_date_30s_ago)"'`].[Timestamp,LogicalResourceId,ResourceStatus]' \
         --output text 2>/dev/null | sort | while read -r line; do
             if [[ -n "$line" ]]; then
                 TIMESTAMP=$(echo "$line" | cut -f1)
@@ -119,66 +132,67 @@ print_header "Getting stack outputs"
 GATEWAY_URL=$(get_stack_output "$AGENTCORE_STACK" "GatewayUrl")
 GATEWAY_ID=$(get_stack_output "$AGENTCORE_STACK" "GatewayId")
 TARGET_ID=$(get_stack_output "$AGENTCORE_STACK" "TargetId")
-MCP_CLIENT_ID=$(get_stack_output "$AGENTCORE_STACK" "MCPClientId")
+OAUTH_METADATA_URL=$(get_stack_output "$AGENTCORE_STACK" "OAuthMetadataUrl")
 USER_POOL_ID=$(get_stack_output "$AGENTCORE_STACK" "UserPoolId")
 USER_POOL_DOMAIN=$(get_stack_output "$AGENTCORE_STACK" "UserPoolDomain")
 LAMBDA_ARN=$(get_stack_output "$AGENTCORE_STACK" "LambdaArn")
 
-# Get MCP client secret (needed for Claude Web configuration)
-MCP_CLIENT_SECRET=$(aws cognito-idp describe-user-pool-client \
-    --user-pool-id "$USER_POOL_ID" \
-    --client-id "$MCP_CLIENT_ID" \
-    --region "$AWS_REGION" \
-    --query 'UserPoolClient.ClientSecret' \
-    --output text 2>/dev/null || echo "")
-
 # Summary
 print_header "AgentCore Gateway Setup Complete"
 
-echo "Gateway ID:    $GATEWAY_ID"
-echo "Gateway URL:   $GATEWAY_URL"
-echo "Target ID:     $TARGET_ID"
-echo "Lambda ARN:    $LAMBDA_ARN"
-echo ""
-echo "Cognito OAuth:"
-echo "  User Pool:     $USER_POOL_ID"
-echo "  Domain:        $USER_POOL_DOMAIN"
-echo "  MCP Client ID: $MCP_CLIENT_ID"
+echo "Gateway ID:       $GATEWAY_ID"
+echo "Gateway URL:      $GATEWAY_URL"
+echo "OAuth Metadata:   $OAUTH_METADATA_URL"
+echo "Target ID:        $TARGET_ID"
+echo "Lambda ARN:       $LAMBDA_ARN"
 echo ""
 
-# Save config
+# Save config using jq for safe JSON generation
 CONFIG_FILE="$PROJECT_DIR/.agentcore-config.json"
-cat > "$CONFIG_FILE" <<EOF
-{
-  "gateway_id": "$GATEWAY_ID",
-  "gateway_url": "$GATEWAY_URL",
-  "target_id": "$TARGET_ID",
-  "lambda_arn": "$LAMBDA_ARN",
-  "cognito_user_pool_id": "$USER_POOL_ID",
-  "cognito_domain": "$USER_POOL_DOMAIN",
-  "mcp_client_id": "$MCP_CLIENT_ID",
-  "mcp_client_secret": "$MCP_CLIENT_SECRET",
-  "agentcore_stack": "$AGENTCORE_STACK",
-  "region": "$AWS_REGION",
-  "prefix": "$RESOURCE_PREFIX",
-  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-}
-EOF
+jq -n \
+    --arg gateway_id "$GATEWAY_ID" \
+    --arg gateway_url "$GATEWAY_URL" \
+    --arg oauth_metadata_url "$OAUTH_METADATA_URL" \
+    --arg target_id "$TARGET_ID" \
+    --arg lambda_arn "$LAMBDA_ARN" \
+    --arg cognito_user_pool_id "$USER_POOL_ID" \
+    --arg cognito_domain "$USER_POOL_DOMAIN" \
+    --arg agentcore_stack "$AGENTCORE_STACK" \
+    --arg region "$AWS_REGION" \
+    --arg prefix "$RESOURCE_PREFIX" \
+    --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{
+      gateway_id: $gateway_id,
+      gateway_url: $gateway_url,
+      oauth_metadata_url: $oauth_metadata_url,
+      target_id: $target_id,
+      lambda_arn: $lambda_arn,
+      cognito_user_pool_id: $cognito_user_pool_id,
+      cognito_domain: $cognito_domain,
+      agentcore_stack: $agentcore_stack,
+      region: $region,
+      prefix: $prefix,
+      created_at: $created_at
+    }' > "$CONFIG_FILE"
 
+chmod 600 "$CONFIG_FILE"
 print_success "Configuration saved to: $CONFIG_FILE"
 
-# Claude Web MCP configuration
+# Claude configuration (simplified with DCR)
 echo ""
-print_header "Claude Web Configuration"
+print_header "Connect Claude to Stache"
 echo ""
-echo "Add this MCP server in Claude Web settings (https://claude.ai/settings/mcp):"
+echo "MCP URL: $GATEWAY_URL"
 echo ""
-echo "  Name:            Stache"
-echo "  URL:             $GATEWAY_URL"
-echo "  Client ID:       $MCP_CLIENT_ID"
-echo "  Client Secret:   $MCP_CLIENT_SECRET"
+echo "Claude Web:"
+echo "  1. Go to https://claude.ai/settings/mcp"
+echo "  2. Add MCP Server"
+echo "  3. Enter URL: $GATEWAY_URL"
+echo "  4. Click Connect - login when prompted"
 echo ""
-echo "When you connect, Claude will redirect to Cognito for login."
-echo "Use your Cognito username and password to authenticate."
+echo "Claude Code:"
+echo "  claude mcp add --transport http stache $GATEWAY_URL"
+echo "  Then run /mcp and click Authenticate"
 echo ""
-echo "See README.md for more details."
+echo "OAuth clients are created automatically via Dynamic Client Registration."
+echo "No client ID or secret needed!"

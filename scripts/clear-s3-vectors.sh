@@ -1,6 +1,6 @@
 #!/bin/bash
 # Clear all vectors from S3 Vectors indexes
-# Usage: AWS_PROFILE=jtpenny-ragbrain ./clear-s3-vectors.sh [--dry-run]
+# Usage: AWS_PROFILE=your-profile ./clear-s3-vectors.sh [--dry-run]
 
 set -e
 
@@ -10,7 +10,8 @@ REGION=${AWS_REGION:-us-east-1}
 PREFIX=${RESOURCE_PREFIX:-stache}
 
 BUCKET="${PREFIX}-vectors-${ACCOUNT_ID}"
-INDEXES=("documents" "summaries" "insights")
+# Index names match template.yaml: ${ResourcePrefix}-{suffix}
+INDEX_SUFFIXES=("vectors" "documents" "summaries" "insights")
 DRY_RUN=false
 
 if [[ "$1" == "--dry-run" ]]; then
@@ -20,12 +21,14 @@ fi
 
 echo "Account: $ACCOUNT_ID"
 echo "Bucket: $BUCKET"
+echo "Prefix: $PREFIX"
 
-for INDEX in "${INDEXES[@]}"; do
-    INDEX_ARN="arn:aws:s3vectors:${REGION}:${ACCOUNT_ID}:bucket/${BUCKET}/index/${INDEX}"
+for SUFFIX in "${INDEX_SUFFIXES[@]}"; do
+    INDEX_NAME="${PREFIX}-${SUFFIX}"
+    INDEX_ARN="arn:aws:s3vectors:${REGION}:${ACCOUNT_ID}:bucket/${BUCKET}/index/${INDEX_NAME}"
 
     echo ""
-    echo "=== Index: $INDEX ==="
+    echo "=== Index: $INDEX_NAME ==="
 
     # List all vectors (loop for pagination)
     NEXT_TOKEN=""
@@ -75,7 +78,7 @@ for INDEX in "${INDEXES[@]}"; do
             2>/dev/null || echo "    Failed to delete batch"
     done
 
-    echo "Deleted $COUNT vectors from $INDEX"
+    echo "Deleted $COUNT vectors from $INDEX_NAME"
 done
 
 echo ""

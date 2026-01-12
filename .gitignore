@@ -6,7 +6,6 @@ layer/
 
 # Sparse checkout directories (from GitHub Actions or local deploy)
 stache-packages/
-stache-frontend/
 
 # Python
 __pycache__/
@@ -64,3 +63,10 @@ mcp_credentials.txt
 
 # SAM deployment config (deployment-specific)
 samconfig.toml
+.secrets
+
+# Ruff cache
+.ruff_cache/
+
+# Local GitHub Actions testing
+.actrc
