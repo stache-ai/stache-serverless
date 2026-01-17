@@ -126,16 +126,86 @@ fi
 
 print_success "AgentCore stack deployed"
 
-# Get outputs
+# Get outputs needed for tool discovery
 print_header "Getting stack outputs"
 
 GATEWAY_URL=$(get_stack_output "$AGENTCORE_STACK" "GatewayUrl")
 GATEWAY_ID=$(get_stack_output "$AGENTCORE_STACK" "GatewayId")
-TARGET_ID=$(get_stack_output "$AGENTCORE_STACK" "TargetId")
+# TargetId from CloudFormation is composite (gateway|target), extract just the target part
+TARGET_ID_RAW=$(get_stack_output "$AGENTCORE_STACK" "TargetId")
+TARGET_ID="${TARGET_ID_RAW##*|}"  # Extract part after pipe
 OAUTH_METADATA_URL=$(get_stack_output "$AGENTCORE_STACK" "OAuthMetadataUrl")
 USER_POOL_ID=$(get_stack_output "$AGENTCORE_STACK" "UserPoolId")
 USER_POOL_DOMAIN=$(get_stack_output "$AGENTCORE_STACK" "UserPoolDomain")
 LAMBDA_ARN=$(get_stack_output "$AGENTCORE_STACK" "LambdaArn")
+
+# Query Lambda for available tools
+print_header "Discovering available tools"
+
+RESPONSE_FILE=$(mktemp)
+# Clean up temp file on exit (append to existing trap if any)
+trap "rm -f $RESPONSE_FILE" EXIT
+
+# Invoke Lambda with _list_tools action
+aws lambda invoke \
+    --function-name "${RESOURCE_PREFIX}-agentcore" \
+    --payload '{"action": "_list_tools"}' \
+    --cli-binary-format raw-in-base64-out \
+    --region "$AWS_REGION" \
+    "$RESPONSE_FILE" >/dev/null
+
+# Validate response has tools array
+if ! jq -e '.tools' "$RESPONSE_FILE" >/dev/null 2>&1; then
+    print_warning "Failed to get tools from Lambda - using CloudFormation-defined tools"
+    cat "$RESPONSE_FILE" >&2
+else
+    TOOL_COUNT=$(jq '.tools | length' "$RESPONSE_FILE")
+    echo "Found $TOOL_COUNT tools from Lambda"
+
+    # Lambda returns tools in camelCase format (name, description, inputSchema)
+    # AgentCore CLI only accepts: type, properties, required, items, description
+    # Must strip unsupported JSON Schema properties: maxLength, minimum, maximum, default, enum
+    TOOL_SCHEMA=$(jq '[.tools[] | {
+        name: .name,
+        description: .description,
+        inputSchema: {
+            type: .inputSchema.type,
+            properties: (
+                .inputSchema.properties // {} | to_entries | map({
+                    (.key): {
+                        type: .value.type,
+                        description: (.value.description // "")
+                    }
+                }) | add // {}
+            ),
+            required: (.inputSchema.required // [])
+        }
+    }]' "$RESPONSE_FILE")
+
+    # Update gateway target with discovered tools
+    echo "Updating gateway target with dynamic tools..."
+
+    if aws bedrock-agentcore-control update-gateway-target \
+        --gateway-identifier "$GATEWAY_ID" \
+        --target-id "$TARGET_ID" \
+        --name "${RESOURCE_PREFIX}-tools" \
+        --target-configuration "{
+            \"mcp\": {
+                \"lambda\": {
+                    \"lambdaArn\": \"$LAMBDA_ARN\",
+                    \"toolSchema\": {
+                        \"inlinePayload\": $TOOL_SCHEMA
+                    }
+                }
+            }
+        }" \
+        --credential-provider-configurations '[{"credentialProviderType": "GATEWAY_IAM_ROLE"}]' \
+        --region "$AWS_REGION" >/dev/null 2>&1; then
+        print_success "Gateway target updated with $TOOL_COUNT tools"
+    else
+        print_warning "Failed to update gateway target - using CloudFormation-defined tools"
+    fi
+fi
 
 # Summary
 print_header "AgentCore Gateway Setup Complete"

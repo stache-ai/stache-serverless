@@ -38,7 +38,8 @@ Globals:
         RERANKER_PROVIDER: simple
 
         # AWS Provider Settings (AWS_REGION is automatically set by Lambda)
-        BEDROCK_LLM_MODEL: anthropic.claude-3-5-sonnet-20241022-v2:0
+        BEDROCK_LLM_MODEL: us.amazon.nova-pro-v1:0
+        BEDROCK_ENRICHMENT_MODEL: us.amazon.nova-lite-v1:0
         BEDROCK_EMBEDDING_MODEL: cohere.embed-english-v3
         S3VECTORS_BUCKET: !Sub '${ResourcePrefix}-vectors-${AWS::AccountId}'
         S3VECTORS_INDEX: !Sub '${ResourcePrefix}-vectors'
@@ -53,6 +54,10 @@ Globals:
         EMBEDDING_DIMENSION: "1024"
         CHUNK_SIZE: "1500"
         CHUNK_OVERLAP: "150"
+
+        # Enrichment Settings
+        AI_ENRICHMENT_ENABLED: "true"
+        ENABLE_SUMMARY_GENERATION: "false"
 
         # CORS - allow CloudFront, custom domain, and localhost
         CORS_ORIGINS: !If

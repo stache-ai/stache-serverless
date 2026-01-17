@@ -173,6 +173,43 @@ def _get_agentcore_context(context):
         return None
 
 
+def _handle_plugin_tool(tool_name: str, params: dict, request_id: str) -> dict | None:
+    """Route to plugin tool handlers discovered via entry points.
+
+    Plugins register handlers via the 'stache.tool_handlers' entry point group.
+    Each handler should be a callable that accepts (tool_name, params, request_id)
+    and returns a dict result or None if it doesn't handle that tool.
+
+    Args:
+        tool_name: Name of the tool to execute
+        params: Tool parameters
+        request_id: Request ID for logging
+
+    Returns:
+        dict with result if plugin handled the tool, None otherwise
+    """
+    from importlib.metadata import entry_points
+
+    try:
+        eps = entry_points(group='stache.tool_handlers')
+    except TypeError:
+        # Python < 3.10 compatibility
+        all_eps = entry_points()
+        eps = all_eps.get('stache.tool_handlers', [])
+
+    for ep in eps:
+        try:
+            handler = ep.load()
+            result = handler(tool_name, params, request_id)
+            if result is not None:
+                logger.debug(f"[{request_id}] Tool {tool_name} handled by plugin {ep.name}")
+                return result
+        except Exception as e:
+            logger.warning(f"[{request_id}] Plugin {ep.name} failed: {e}")
+
+    return None
+
+
 def _handle_agentcore_tool(custom: dict, params: dict) -> dict:
     """Route AgentCore tool calls to shared operations.
 
@@ -307,6 +344,11 @@ def _handle_agentcore_tool(custom: dict, params: dict) -> dict:
             )
 
         else:
+            # Try plugin tools if available
+            plugin_result = _handle_plugin_tool(tool_name, params, request_id)
+            if plugin_result is not None:
+                return plugin_result
+
             logger.warning(f"[{request_id}] Unknown tool: {tool_name}")
             return {"error": f"Unknown tool: {tool_name}", "request_id": request_id}
 
@@ -345,6 +387,20 @@ def handler(event, context):
     Returns:
         dict: Tool execution result
     """
+    # Internal action: list available tools for gateway setup
+    # Only responds to direct Lambda invoke (no AgentCore context)
+    if event.get("action") == "_list_tools":
+        agentcore_ctx = _get_agentcore_context(context)
+        if agentcore_ctx is not None:
+            # Reject if called via gateway (shouldn't happen, but safety check)
+            logger.warning("_list_tools called via gateway - rejecting")
+            return {"error": "Internal action not available via gateway"}
+        logger.info("_list_tools invoked for tool discovery")
+        from .mcp_tools import get_tools_as_mcp_format
+        tools = get_tools_as_mcp_format()
+        logger.info(f"Returning {len(tools)} tools")
+        return {"tools": tools}
+
     # Validate this is an AgentCore invocation
     custom = _get_agentcore_context(context)
     if not custom:
