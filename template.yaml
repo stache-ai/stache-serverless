@@ -17,8 +17,13 @@ Parameters:
     Type: String
     Description: ACM certificate ARN for custom domain (required if AppDomain is set)
     Default: ""
+  EnterpriseLayerArn:
+    Type: String
+    Description: Optional enterprise extension layer ARN (from stache-enterprise stack)
+    Default: ""
 Conditions:
   UseCustomDomain: !Not [!Equals [!Ref AppDomain, ""]]
+  HasEnterpriseLayer: !Not [!Equals [!Ref EnterpriseLayerArn, ""]]
 
 Globals:
   Function:
@@ -80,12 +85,16 @@ Resources:
   # S3 Vectors bucket for vector storage (NOT an S3 bucket - different service)
   S3VectorsBucket:
     Type: AWS::S3Vectors::VectorBucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       VectorBucketName: !Sub '${ResourcePrefix}-vectors-${AWS::AccountId}'
 
   # S3 Vectors index for document chunks
   VectorsIndex:
     Type: AWS::S3Vectors::Index
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       VectorBucketArn: !GetAtt S3VectorsBucket.VectorBucketArn
       IndexName: !Sub '${ResourcePrefix}-vectors'
@@ -99,6 +108,8 @@ Resources:
   # S3 Vectors index for documents
   DocumentsVectorIndex:
     Type: AWS::S3Vectors::Index
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       VectorBucketArn: !GetAtt S3VectorsBucket.VectorBucketArn
       IndexName: !Sub '${ResourcePrefix}-documents'
@@ -112,6 +123,8 @@ Resources:
   # S3 Vectors index for summaries
   SummariesVectorIndex:
     Type: AWS::S3Vectors::Index
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       VectorBucketArn: !GetAtt S3VectorsBucket.VectorBucketArn
       IndexName: !Sub '${ResourcePrefix}-summaries'
@@ -125,6 +138,8 @@ Resources:
   # S3 Vectors index for insights
   InsightsVectorIndex:
     Type: AWS::S3Vectors::Index
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       VectorBucketArn: !GetAtt S3VectorsBucket.VectorBucketArn
       IndexName: !Sub '${ResourcePrefix}-insights'
@@ -216,9 +231,12 @@ Resources:
   # DynamoDB table for namespace registry
   NamespaceTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Sub '${ResourcePrefix}-namespaces'
       BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: true
       AttributeDefinitions:
         - AttributeName: id
           AttributeType: S
@@ -241,9 +259,12 @@ Resources:
   # GSI2: filename lookups (GSI2PK=FILENAME#{ns}#{file}, GSI2SK=CREATED#{ts})
   DocumentsTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Sub '${ResourcePrefix}-documents'
       BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: true
       AttributeDefinitions:
         - AttributeName: PK
           AttributeType: S
@@ -394,6 +415,7 @@ Resources:
       Handler: src.api_handler.handler
       Layers:
         - !Ref StacheLayer
+        - !If [HasEnterpriseLayer, !Ref EnterpriseLayerArn, !Ref "AWS::NoValue"]
       DeadLetterQueue:
         Type: SQS
         TargetArn: !GetAtt LambdaDLQ.Arn
@@ -469,6 +491,7 @@ Resources:
       Handler: src.agentcore_handler.handler
       Layers:
         - !Ref StacheLayer
+        - !If [HasEnterpriseLayer, !Ref EnterpriseLayerArn, !Ref "AWS::NoValue"]
       DeadLetterQueue:
         Type: SQS
         TargetArn: !GetAtt LambdaDLQ.Arn

@@ -158,6 +158,14 @@ build_sam_params() {
         params="$params CertificateArn=$CERT_ARN"
     fi
 
+    # Check for enterprise stack and add layer ARN if exists
+    local enterprise_stack="${RESOURCE_PREFIX}-enterprise"
+    local enterprise_layer_arn=$(get_stack_output "$enterprise_stack" "EnterpriseLayerArn")
+    if [[ -n "$enterprise_layer_arn" ]] && [[ "$enterprise_layer_arn" != "None" ]]; then
+        params="$params EnterpriseLayerArn=$enterprise_layer_arn"
+        print_success "Found enterprise layer: $enterprise_layer_arn" >&2
+    fi
+
     echo "$params"
 }
 
