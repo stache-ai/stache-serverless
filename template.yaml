@@ -57,8 +57,8 @@ Globals:
         # General Settings
         LOG_LEVEL: info
         EMBEDDING_DIMENSION: "1024"
-        CHUNK_SIZE: "1500"
-        CHUNK_OVERLAP: "150"
+        CHUNK_SIZE: "1000"
+        CHUNK_OVERLAP: "100"
 
         # Enrichment Settings
         AI_ENRICHMENT_ENABLED: "true"
@@ -306,6 +306,8 @@ Resources:
     Type: AWS::Cognito::UserPool
     Properties:
       UserPoolName: !Sub '${AWS::StackName}-users'
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
       AutoVerifiedAttributes:
         - email
       UsernameAttributes:
@@ -532,6 +534,84 @@ Resources:
               Resource:
                 - !Sub '${S3VectorsBucket.VectorBucketArn}/index/*'
 
+  # Lambda function for cleanup worker (processes cleanup jobs from document deletion)
+  CleanupWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-cleanup-worker'
+      CodeUri: ./
+      Handler: stache_ai.workers.cleanup_worker.lambda_handler
+      Timeout: 300
+      MemorySize: 512
+      Layers:
+        - !Ref StacheLayer
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DocumentsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3vectors:GetVectorBucket
+              Resource:
+                - !GetAtt S3VectorsBucket.VectorBucketArn
+            - Effect: Allow
+              Action:
+                - s3vectors:CreateIndex
+                - s3vectors:GetIndex
+                - s3vectors:ListIndexes
+                - s3vectors:PutVectors
+                - s3vectors:QueryVectors
+                - s3vectors:ListVectors
+                - s3vectors:DeleteVectors
+                - s3vectors:GetVectors
+              Resource:
+                - !Sub '${S3VectorsBucket.VectorBucketArn}/index/*'
+      Events:
+        ScheduledCleanup:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Enabled: true
+
+  # Lambda function for trash purge worker (runs periodically to delete expired documents)
+  TrashPurgeWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-trash-purge'
+      CodeUri: ./
+      Handler: stache_ai.workers.trash_purge_worker.lambda_handler
+      Timeout: 600
+      MemorySize: 256
+      Layers:
+        - !Ref StacheLayer
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DocumentsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3vectors:GetVectorBucket
+              Resource:
+                - !GetAtt S3VectorsBucket.VectorBucketArn
+            - Effect: Allow
+              Action:
+                - s3vectors:CreateIndex
+                - s3vectors:GetIndex
+                - s3vectors:ListIndexes
+                - s3vectors:PutVectors
+                - s3vectors:QueryVectors
+                - s3vectors:ListVectors
+                - s3vectors:DeleteVectors
+                - s3vectors:GetVectors
+              Resource:
+                - !Sub '${S3VectorsBucket.VectorBucketArn}/index/*'
+      Events:
+        DailyPurge:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 2 * * ? *)
+            Enabled: true
+
   # Dead Letter Queue for failed Lambda invocations
   LambdaDLQ:
     Type: AWS::SQS::Queue
@@ -598,6 +678,7 @@ Resources:
           - GET
           - POST
           - PUT
+          - PATCH
           - DELETE
           - OPTIONS
         AllowHeaders:
@@ -726,6 +807,14 @@ Outputs:
   ApiFunctionRoleArn:
     Description: IAM role ARN for API Lambda (assume this for local dev)
     Value: !GetAtt ApiFunctionRole.Arn
+
+  CleanupWorkerFunction:
+    Description: Cleanup worker Lambda function name
+    Value: !Ref CleanupWorkerFunction
+
+  TrashPurgeWorkerFunction:
+    Description: Trash purge worker Lambda function name
+    Value: !Ref TrashPurgeWorkerFunction
 
   S3VectorsIndexArn:
     Description: S3 Vectors index ARN
