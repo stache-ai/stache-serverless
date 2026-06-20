@@ -491,13 +491,9 @@ jobs:
           USER_POOL_DOMAIN=$(get_output "UserPoolDomain")
           LAMBDA_ARN=$(get_output "LambdaArn")
 
-          # Get MCP client secret
-          MCP_CLIENT_SECRET=$(aws cognito-idp describe-user-pool-client \
-            --user-pool-id "$USER_POOL_ID" \
-            --client-id "$MCP_CLIENT_ID" \
-            --query 'UserPoolClient.ClientSecret' \
-            --output text 2>/dev/null || echo "")
-
+          # The MCP client secret is deliberately NOT fetched or exported here:
+          # step summaries and outputs are readable by anyone with read access
+          # to the workflow run. Operators fetch it themselves (see summary).
           echo "gateway_url=$GATEWAY_URL" >> $GITHUB_OUTPUT
           echo "gateway_id=$GATEWAY_ID" >> $GITHUB_OUTPUT
           echo "target_id=$TARGET_ID" >> $GITHUB_OUTPUT
@@ -505,7 +501,6 @@ jobs:
           echo "user_pool_id=$USER_POOL_ID" >> $GITHUB_OUTPUT
           echo "user_pool_domain=$USER_POOL_DOMAIN" >> $GITHUB_OUTPUT
           echo "lambda_arn=$LAMBDA_ARN" >> $GITHUB_OUTPUT
-          echo "mcp_client_secret=$MCP_CLIENT_SECRET" >> $GITHUB_OUTPUT
 
       # ============================================================
       # CREATE USER (full with email, user-only)
@@ -695,7 +690,12 @@ jobs:
             echo "| Name | Stache |" >> $GITHUB_STEP_SUMMARY
             echo "| URL | \`${{ steps.agentcore.outputs.gateway_url }}\` |" >> $GITHUB_STEP_SUMMARY
             echo "| Client ID | \`${{ steps.agentcore.outputs.mcp_client_id }}\` |" >> $GITHUB_STEP_SUMMARY
-            echo "| Client Secret | \`${{ steps.agentcore.outputs.mcp_client_secret }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Fetch the client secret locally (never shown in CI output):" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "aws cognito-idp describe-user-pool-client --user-pool-id ${{ steps.agentcore.outputs.user_pool_id }} --client-id ${{ steps.agentcore.outputs.mcp_client_id }} --query 'UserPoolClient.ClientSecret' --output text" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
 

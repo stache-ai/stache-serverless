@@ -15,6 +15,14 @@ Parameters:
     Default: ''
     Description: Existing OIDC Provider ARN (leave empty to create new)
 
+  AllowedRef:
+    Type: String
+    Default: ref:refs/heads/main
+    Description: >
+      OIDC subject suffix allowed to assume the deploy role. Defaults to the
+      main branch only; use environment:production for a protected environment.
+      Never use '*' - it lets any branch or PR workflow deploy.
+
 Conditions:
   CreateOIDCProvider: !Equals [!Ref OIDCProviderArn, '']
 
@@ -170,7 +178,7 @@ Resources:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
               StringLike:
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubRepo}:*
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubRepo}:${AllowedRef}
       ManagedPolicyArns:
         - !Ref ScopedResourcesPolicy
         - !Ref GlobalResourcesPolicy

@@ -17,6 +17,13 @@ Parameters:
     Type: String
     Description: Custom domain for MCP endpoint (e.g., stache.example.com) - optional
     Default: ""
+  AllowedRedirectHosts:
+    Type: String
+    Default: "claude.ai,claude.com"
+    Description: >
+      Comma-separated hostnames allowed as https redirect_uris in DCR requests.
+      Loopback http URIs (127.0.0.1, localhost, [::1]) are always allowed per
+      RFC 8252. Claude Web registers with an https callback on claude.ai/claude.com.
 
 Conditions:
   HasCustomDomain: !Not [!Equals [!Ref CustomMCPDomain, ""]]
@@ -169,7 +176,7 @@ Resources:
                     "authorization_endpoint": "https://${UserPoolDomain}/oauth2/authorize",
                     "token_endpoint": "https://${UserPoolDomain}/oauth2/token",
                     "registration_endpoint": "https://${OAuthMetadataApi}.execute-api.${AWS::Region}.amazonaws.com/prod/register",
-                    "scopes_supported": ["openid", "email", "profile", "${ResourcePrefix}-mcp/read", "${ResourcePrefix}-mcp/write"],
+                    "scopes_supported": ["openid", "email", "profile", "${ResourcePrefix}-mcp/write"],
                     "response_types_supported": ["code"],
                     "grant_types_supported": ["authorization_code", "refresh_token"],
                     "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
@@ -218,8 +225,8 @@ Resources:
                     "revocation_endpoint": "https://${UserPoolDomain}/oauth2/revoke",
                     "jwks_uri": "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}/.well-known/jwks.json",
                     "registration_endpoint": "https://${OAuthMetadataApi}.execute-api.${AWS::Region}.amazonaws.com/prod/register",
-                    "scopes_supported": ["openid", "email", "phone", "profile", "${ResourcePrefix}-mcp/read", "${ResourcePrefix}-mcp/write"],
-                    "response_types_supported": ["code", "token"],
+                    "scopes_supported": ["openid", "email", "phone", "profile", "${ResourcePrefix}-mcp/write"],
+                    "response_types_supported": ["code"],
                     "grant_types_supported": ["authorization_code", "refresh_token"],
                     "subject_types_supported": ["public"],
                     "id_token_signing_alg_values_supported": ["RS256"],
@@ -275,9 +282,12 @@ Resources:
               - Effect: Allow
                 Action:
                   - bedrock-agentcore:ListGateways
+                Resource: '*'
+              - Effect: Allow
+                Action:
                   - bedrock-agentcore:GetGateway
                   - bedrock-agentcore:UpdateGateway
-                Resource: '*'
+                Resource: !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*'
               - Effect: Allow
                 Action:
                   - iam:PassRole
@@ -299,6 +309,7 @@ Resources:
             Fn::Sub: '${MainStackName}-UserPoolId'
           GATEWAY_NAME: !Sub '${ResourcePrefix}-mcp-gateway'
           RESOURCE_PREFIX: !Ref ResourcePrefix
+          ALLOWED_REDIRECT_HOSTS: !Ref AllowedRedirectHosts
       Code:
         ZipFile: |
           import json
@@ -307,12 +318,32 @@ Resources:
           import boto3
           import uuid
           import logging
+          from urllib.parse import urlparse
 
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
 
           cognito = boto3.client('cognito-idp')
           agentcore = boto3.client('bedrock-agentcore-control')
+
+          # RFC 8252: native clients use loopback redirects
+          LOOPBACK_HOSTS = {'127.0.0.1', 'localhost', '::1'}
+
+          def is_allowed_redirect_uri(uri, extra_https_hosts):
+              if not isinstance(uri, str):
+                  return False
+              try:
+                  parsed = urlparse(uri)
+              except ValueError:
+                  return False
+              host = (parsed.hostname or '').lower()
+              if not host:
+                  return False
+              if parsed.scheme == 'http':
+                  return host in LOOPBACK_HOSTS
+              if parsed.scheme == 'https':
+                  return host in extra_https_hosts
+              return False
 
           def find_gateway_by_name(name):
               """Find gateway ID by name since we can't reference it directly (circular dep)"""
@@ -327,7 +358,8 @@ Resources:
               return None
 
           def handler(event, context):
-              logger.info(f"DCR request: {json.dumps(event)}")
+              # Auth service: never log the full event (bodies/headers may carry credentials)
+              logger.info(f"DCR request: {event.get('httpMethod')} {event.get('path')} from {event.get('requestContext', {}).get('identity', {}).get('sourceIp')}")
 
               # Parse request body
               try:
@@ -346,6 +378,17 @@ Resources:
               if not isinstance(redirect_uris, list) or not redirect_uris:
                   return response(400, {'error': 'invalid_redirect_uri', 'error_description': 'redirect_uris must be a non-empty array'})
 
+              # Registered clients are auto-trusted by the gateway, so an
+              # attacker-controlled redirect URI enables auth-code phishing.
+              # Allow only loopback (RFC 8252) plus explicitly configured hosts.
+              extra_https_hosts = {
+                  h.strip().lower() for h in os.environ.get('ALLOWED_REDIRECT_HOSTS', '').split(',') if h.strip()
+              }
+              rejected = [u for u in redirect_uris if not is_allowed_redirect_uri(u, extra_https_hosts)]
+              if rejected:
+                  logger.warning(f"Rejected redirect_uris: {rejected}")
+                  return response(400, {'error': 'invalid_redirect_uri', 'error_description': 'redirect_uris must be loopback (http://127.0.0.1, http://localhost, http://[::1]) or an https URI on an allowed host'})
+
               user_pool_id = os.environ['USER_POOL_ID']
               gateway_name = os.environ['GATEWAY_NAME']
               prefix = os.environ['RESOURCE_PREFIX']
@@ -358,7 +401,7 @@ Resources:
                       GenerateSecret=True,
                       ExplicitAuthFlows=['ALLOW_USER_SRP_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
                       AllowedOAuthFlows=['code'],
-                      AllowedOAuthScopes=['email', 'openid', 'phone', 'profile', f'{prefix}-mcp/read', f'{prefix}-mcp/write'],
+                      AllowedOAuthScopes=['email', 'openid', 'phone', 'profile', f'{prefix}-mcp/write'],
                       AllowedOAuthFlowsUserPoolClient=True,
                       CallbackURLs=redirect_uris,
                       SupportedIdentityProviders=['COGNITO']
@@ -499,6 +542,13 @@ Resources:
       RestApiId: !Ref OAuthMetadataApi
       DeploymentId: !Ref OAuthMetadataDeploymentV6
       StageName: prod
+      MethodSettings:
+        # Registration is rare; throttle hard so /register can't be used to
+        # exhaust the Cognito app-client quota or run up cost
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          ThrottlingRateLimit: 2
+          ThrottlingBurstLimit: 10
 
   # IAM Role for AgentCore Gateway to invoke Lambda
   AgentCoreGatewayRole:

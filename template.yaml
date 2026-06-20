@@ -27,8 +27,8 @@ Conditions:
 
 Globals:
   Function:
-    Timeout: 300
-    MemorySize: 512
+    Timeout: 900
+    MemorySize: 2048
     Runtime: python3.12
     Architectures:
       - x86_64
@@ -237,6 +237,8 @@ Resources:
       TableName: !Sub '${ResourcePrefix}-namespaces'
       BillingMode: PAY_PER_REQUEST
       DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       AttributeDefinitions:
         - AttributeName: id
           AttributeType: S
@@ -265,6 +267,8 @@ Resources:
       TableName: !Sub '${ResourcePrefix}-documents'
       BillingMode: PAY_PER_REQUEST
       DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       AttributeDefinitions:
         - AttributeName: PK
           AttributeType: S
@@ -415,6 +419,7 @@ Resources:
       FunctionName: !Sub '${ResourcePrefix}-api'
       CodeUri: ./
       Handler: src.api_handler.handler
+      MemorySize: 2048
       Layers:
         - !Ref StacheLayer
         - !If [HasEnterpriseLayer, !Ref EnterpriseLayerArn, !Ref "AWS::NoValue"]
@@ -491,6 +496,7 @@ Resources:
       FunctionName: !Sub '${ResourcePrefix}-agentcore'
       CodeUri: ./
       Handler: src.agentcore_handler.handler
+      MemorySize: 2048
       Layers:
         - !Ref StacheLayer
         - !If [HasEnterpriseLayer, !Ref EnterpriseLayerArn, !Ref "AWS::NoValue"]

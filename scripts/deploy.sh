@@ -12,6 +12,7 @@ set -e
 #   --skip-backend              Skip SAM build and deploy (frontend only)
 #   --skip-layer                Skip Lambda layer build (use existing)
 #   -s, --sam-only              Just run sam deploy (skip layer, sam build, frontend)
+#   -l, --layer-only            Rebuild layer and deploy (skip sam build, frontend)
 #   --from-source [path]        Build from local source instead of PyPI (default: ../stache)
 #   --local-env [file]          Output .env file for local development (skips deploy)
 #   -h, --help                  Show this help message
@@ -80,6 +81,11 @@ while [[ $# -gt 0 ]]; do
         --sam-only|-s)
             SAM_ONLY=true
             SKIP_LAYER=true
+            SKIP_FRONTEND=true
+            shift
+            ;;
+        --layer-only|-l)
+            SAM_ONLY=true
             SKIP_FRONTEND=true
             shift
             ;;
@@ -242,20 +248,25 @@ if [[ "$SKIP_FRONTEND" == false ]]; then
         FRONTEND_DIR="$(cd "$FROM_SOURCE/frontend" 2>/dev/null && pwd)"
     fi
 
-    if [[ -z "$FRONTEND_DIR" ]] && [[ -d "$PROJECT_DIR/stache-frontend/frontend" ]]; then
-        # Submodule
-        FRONTEND_DIR="$(cd "$PROJECT_DIR/stache-frontend/frontend" && pwd)"
-    fi
-
+    # Prefer the sibling stache repo (current source) over the vendored
+    # submodule snapshot: the snapshot has drifted badly before (deployed
+    # months-old UI missing whole pages without anyone noticing)
     if [[ -z "$FRONTEND_DIR" ]] && [[ -d "$PROJECT_DIR/../stache/frontend" ]]; then
         # Sibling directory
         FRONTEND_DIR="$(cd "$PROJECT_DIR/../stache/frontend" && pwd)"
     fi
 
+    if [[ -z "$FRONTEND_DIR" ]] && [[ -d "$PROJECT_DIR/stache-frontend/frontend" ]]; then
+        # Submodule snapshot (fallback only)
+        FRONTEND_DIR="$(cd "$PROJECT_DIR/stache-frontend/frontend" && pwd)"
+        print_warning "Using vendored frontend snapshot at $FRONTEND_DIR"
+        print_warning "This copy may be stale - prefer --from-source or a sibling stache checkout"
+    fi
+
     if [[ -z "$FRONTEND_DIR" ]]; then
         print_error "Frontend not found. Checked:"
-        echo "  - $PROJECT_DIR/stache-frontend/frontend (submodule)"
         echo "  - $PROJECT_DIR/../stache/frontend (sibling dir)"
+        echo "  - $PROJECT_DIR/stache-frontend/frontend (submodule)"
         echo "Use --from-source <path> to specify stache repo, or --skip-frontend"
         exit 1
     fi
