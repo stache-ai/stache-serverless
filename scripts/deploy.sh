@@ -185,6 +185,7 @@ if [[ "$SKIP_BACKEND" == false ]]; then
                 "$FROM_SOURCE/packages/stache-ai-bedrock" \
                 "$FROM_SOURCE/packages/stache-ai-s3vectors" \
                 "$FROM_SOURCE/packages/stache-ai-dynamodb" \
+                "$FROM_SOURCE/packages/stache-ai-aws" \
                 "$FROM_SOURCE/packages/stache-ai-documents" \
                 mangum \
                 -t "$PROJECT_DIR/layer/python" --quiet
@@ -195,6 +196,7 @@ if [[ "$SKIP_BACKEND" == false ]]; then
                 stache-ai-bedrock \
                 stache-ai-s3vectors \
                 stache-ai-dynamodb \
+                stache-ai-aws \
                 stache-ai-documents \
                 mangum \
                 -t "$PROJECT_DIR/layer/python" --quiet

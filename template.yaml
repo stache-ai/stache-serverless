@@ -21,6 +21,10 @@ Parameters:
     Type: String
     Description: Optional enterprise extension layer ARN (from stache-enterprise stack)
     Default: ""
+  UploadCorsOrigins:
+    Type: CommaDelimitedList
+    Description: Allowed origins for presigned-upload CORS on OriginalsBucket (app + mobile origins). Default "*" keeps dev simple; pin origins in prod.
+    Default: "*"
 Conditions:
   UseCustomDomain: !Not [!Equals [!Ref AppDomain, ""]]
   HasEnterpriseLayer: !Not [!Equals [!Ref EnterpriseLayerArn, ""]]
@@ -426,11 +430,29 @@ Resources:
       DeadLetterQueue:
         Type: SQS
         TargetArn: !GetAtt LambdaDLQ.Arn
+      Environment:
+        Variables:
+          # Ingestion Phase 2 - AWS async tier
+          INGEST_QUEUE_PROVIDER: sqs
+          INGEST_JOBSTORE_PROVIDER: dynamodb
+          INGEST_BLOB_PROVIDER: s3
+          INGEST_QUEUE_SQS_URL: !Ref IngestQueue
+          INGEST_JOBSTORE_DYNAMODB_TABLE: !Ref IngestJobsTable
+          INGEST_BLOB_S3_BUCKET: !Ref OriginalsBucket
+          # Phase 3 - hand out presigned PUT URLs for large/mobile uploads.
+          # S3CrudPolicy on OriginalsBucket (below) grants the s3:PutObject needed to sign.
+          INGEST_INTAKE_PROVIDER: s3presign
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref NamespaceTable
         - DynamoDBCrudPolicy:
             TableName: !Ref DocumentsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IngestJobsTable
+        - S3CrudPolicy:
+            BucketName: !Ref OriginalsBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt IngestQueue.QueueName
         - Statement:
             # Bedrock access - wildcard resource required for cross-region inference profiles
             - Effect: Allow
@@ -626,6 +648,227 @@ Resources:
       MessageRetentionPeriod: 1209600  # 14 days
       VisibilityTimeout: 300
 
+  # =========================================================================
+  # Ingestion Phase 2 - AWS async tier (S3 originals + SQS + DynamoDB jobs)
+  # =========================================================================
+
+  # S3 bucket for retained originals (kept forever - no lifecycle expiry).
+  # Producers can drop objects under producers/ to trigger ingestion.
+  OriginalsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # S3 -> SQS notification requires the queue policy to exist first
+    DependsOn: IngestQueuePolicy
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-originals-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      # Phase 3 - allow browsers/mobile clients to PUT directly to presigned URLs.
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods:
+              - PUT
+              - GET
+            AllowedOrigins: !Ref UploadCorsOrigins
+            AllowedHeaders:
+              - '*'
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3000
+      NotificationConfiguration:
+        QueueConfigurations:
+          # No prefix filter: producer drops (producers/) AND presign uploads
+          # (originals/{job_id}/{filename}) must both enqueue. The worker branches on
+          # whether the key's job_id maps to an existing job (presign) vs a raw drop.
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt IngestQueue.Arn
+
+  # DynamoDB table for ingestion job records
+  # PK: job_id; GSI1 (requested_by queries), GSI2 (status queries)
+  # Job records expire via TTL (ttl); originals in S3 do not.
+  IngestJobsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ResourcePrefix}-ingest-jobs'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+        - AttributeName: GSI2PK
+          AttributeType: S
+        - AttributeName: GSI2SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: GSI2
+          KeySchema:
+            - AttributeName: GSI2PK
+              KeyType: HASH
+            - AttributeName: GSI2SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # SQS queue for ingestion jobs (worker drives the pipeline off-request)
+  IngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ResourcePrefix}-ingest-queue'
+      VisibilityTimeout: 960  # >= worker timeout (900s)
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IngestDLQ.Arn
+        maxReceiveCount: 3
+
+  # Dead Letter Queue for ingestion jobs that fail repeatedly
+  IngestDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ResourcePrefix}-ingest-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # Allow S3 (OriginalsBucket) to send object-created notifications to the queue.
+  # SourceArn uses !Sub (not !Ref OriginalsBucket) to break the circular dependency.
+  IngestQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref IngestQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt IngestQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:aws:s3:::${ResourcePrefix}-originals-${AWS::AccountId}'
+
+  # Worker Lambda - consumes ingest jobs from SQS and runs the pipeline
+  IngestWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-ingest-worker'
+      CodeUri: ./
+      Handler: stache_ai.ingestion.sqs_worker.lambda_handler
+      Timeout: 900
+      MemorySize: 2048
+      Layers:
+        - !Ref StacheLayer
+        - !If [HasEnterpriseLayer, !Ref EnterpriseLayerArn, !Ref "AWS::NoValue"]
+      Environment:
+        Variables:
+          INGEST_QUEUE_PROVIDER: sqs
+          INGEST_JOBSTORE_PROVIDER: dynamodb
+          INGEST_BLOB_PROVIDER: s3
+          INGEST_QUEUE_SQS_URL: !Ref IngestQueue
+          INGEST_JOBSTORE_DYNAMODB_TABLE: !Ref IngestJobsTable
+          INGEST_BLOB_S3_BUCKET: !Ref OriginalsBucket
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IngestJobsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DocumentsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NamespaceTable
+        - S3CrudPolicy:
+            BucketName: !Ref OriginalsBucket
+        - Statement:
+            # Bedrock access - wildcard resource required for cross-region inference profiles
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:Converse
+              Resource: '*'
+            # Marketplace permissions for Bedrock model access
+            - Effect: Allow
+              Action:
+                - aws-marketplace:ViewSubscriptions
+                - aws-marketplace:Subscribe
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - s3vectors:GetVectorBucket
+              Resource:
+                - !GetAtt S3VectorsBucket.VectorBucketArn
+            - Effect: Allow
+              Action:
+                - s3vectors:CreateIndex
+                - s3vectors:GetIndex
+                - s3vectors:ListIndexes
+                - s3vectors:PutVectors
+                - s3vectors:QueryVectors
+                - s3vectors:ListVectors
+                - s3vectors:DeleteVectors
+                - s3vectors:GetVectors
+              Resource:
+                - !Sub '${S3VectorsBucket.VectorBucketArn}/index/*'
+      Events:
+        SqsTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IngestQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  # Reaper Lambda - marks jobs wedged in processing as failed (retryable)
+  IngestReaperFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-ingest-reaper'
+      CodeUri: ./
+      Handler: stache_ai.ingestion.reaper.lambda_handler
+      Timeout: 300
+      MemorySize: 256
+      Layers:
+        - !Ref StacheLayer
+      Environment:
+        Variables:
+          INGEST_JOBSTORE_PROVIDER: dynamodb
+          INGEST_JOBSTORE_DYNAMODB_TABLE: !Ref IngestJobsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IngestJobsTable
+      Events:
+        ScheduledReap:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Enabled: true
+
   # CloudWatch Alarm for API Function Errors
   ApiErrorAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -736,6 +979,18 @@ Outputs:
   DocumentsTable:
     Description: DynamoDB documents table
     Value: !Ref DocumentsTable
+
+  OriginalsBucket:
+    Description: S3 bucket for retained ingestion originals
+    Value: !Ref OriginalsBucket
+
+  IngestQueueUrl:
+    Description: SQS queue URL for ingestion jobs
+    Value: !Ref IngestQueue
+
+  IngestJobsTable:
+    Description: DynamoDB ingestion jobs table
+    Value: !Ref IngestJobsTable
 
   UserPoolId:
     Description: Cognito User Pool ID

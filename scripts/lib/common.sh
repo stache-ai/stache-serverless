@@ -286,6 +286,9 @@ generate_local_env() {
     local output_file="$1"
     local role_arn=$(get_stack_output "$STACK_NAME" "ApiFunctionRoleArn")
     local index_arn=$(get_stack_output "$STACK_NAME" "S3VectorsIndexArn")
+    local ingest_queue_url=$(get_stack_output "$STACK_NAME" "IngestQueueUrl")
+    local originals_bucket=$(get_stack_output "$STACK_NAME" "OriginalsBucket")
+    local ingest_jobs_table=$(get_stack_output "$STACK_NAME" "IngestJobsTable")
 
     cat > "$output_file" << EOF
 # Stache Local Development Environment
@@ -322,6 +325,19 @@ DYNAMODB_DOCUMENT_INDEX_TABLE=${RESOURCE_PREFIX}-documents
 
 # Lambda IAM Role (for assuming)
 STACHE_LAMBDA_ROLE_ARN=$role_arn
+
+# =============================================================================
+# INGESTION PHASE 2 - AWS ASYNC TIER
+# =============================================================================
+# Defaults to the in-process sync tier; set these to enable the async tier.
+INGEST_QUEUE_PROVIDER=sqs
+INGEST_JOBSTORE_PROVIDER=dynamodb
+INGEST_BLOB_PROVIDER=s3
+INGEST_QUEUE_SQS_URL=$ingest_queue_url
+INGEST_JOBSTORE_DYNAMODB_TABLE=$ingest_jobs_table
+INGEST_BLOB_S3_BUCKET=$originals_bucket
+# Phase 3 - presigned upload intake (hand out presigned PUT URLs)
+INGEST_INTAKE_PROVIDER=s3presign
 
 # =============================================================================
 # STACHE-TOOLS / MCP CONFIGURATION
