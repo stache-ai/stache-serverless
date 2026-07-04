@@ -206,6 +206,13 @@ if [[ "$SKIP_BACKEND" == false ]]; then
         find "$PROJECT_DIR/layer/python" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
         find "$PROJECT_DIR/layer/python" -type d -name "*.dist-info" ! -name "stache_ai*.dist-info" -exec rm -rf {} + 2>/dev/null || true
         find "$PROJECT_DIR/layer/python" -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
+        # Drop the uvicorn dev-server stack — unused under Mangum/Lambda (nothing imports it),
+        # and it double-counts (CodeUri copies the layer into each function package) against the
+        # 250MB layer+code limit. Keep boto3/botocore: the layer's boto3 1.43.x provides s3vectors,
+        # which the Lambda runtime's older boto3 lacks.
+        for pkg in uvloop uvicorn httptools watchfiles websockets; do
+            rm -rf "$PROJECT_DIR/layer/python/$pkg" 2>/dev/null || true
+        done
 
         LAYER_SIZE=$(du -sh "$PROJECT_DIR/layer" | cut -f1)
         print_success "Lambda layer built ($LAYER_SIZE)"

@@ -835,6 +835,26 @@ Resources:
                 - s3vectors:GetVectors
               Resource:
                 - !Sub '${S3VectorsBucket.VectorBucketArn}/index/*'
+            # Enterprise concept graph (parity with the API function): resolve the
+            # concepts table name from SSM and read/write the concept DynamoDB tables.
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ResourcePrefix}/enterprise/concepts-table'
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:BatchGetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+                - dynamodb:Scan
+                - dynamodb:DeleteItem
+                - dynamodb:BatchWriteItem
+              Resource:
+                - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ResourcePrefix}-concept*'
+                - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ResourcePrefix}-concept*/index/*'
       Events:
         SqsTrigger:
           Type: SQS
