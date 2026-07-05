@@ -653,7 +653,9 @@ Resources:
   # =========================================================================
 
   # S3 bucket for retained originals (kept forever - no lifecycle expiry).
-  # Producers can drop objects under producers/ to trigger ingestion.
+  # Producers trigger ingestion by dropping objects under the configured blob
+  # prefix (originals/ by default), e.g. originals/<any-path>/file.pdf. The
+  # S3BlobStore prepends the prefix; the worker strips it to recover the key.
   OriginalsBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
@@ -687,7 +689,7 @@ Resources:
             MaxAge: 3000
       NotificationConfiguration:
         QueueConfigurations:
-          # No prefix filter: producer drops (producers/) AND presign uploads
+          # No prefix filter: producer drops (originals/<path>) AND presign uploads
           # (originals/{job_id}/{filename}) must both enqueue. The worker branches on
           # whether the key's job_id maps to an existing job (presign) vs a raw drop.
           - Event: s3:ObjectCreated:*
@@ -781,7 +783,7 @@ Resources:
     Properties:
       FunctionName: !Sub '${ResourcePrefix}-ingest-worker'
       CodeUri: ./
-      Handler: stache_ai.ingestion.sqs_worker.lambda_handler
+      Handler: stache_ai_aws.sqs_worker.lambda_handler
       Timeout: 900
       MemorySize: 2048
       Layers:
@@ -870,7 +872,7 @@ Resources:
     Properties:
       FunctionName: !Sub '${ResourcePrefix}-ingest-reaper'
       CodeUri: ./
-      Handler: stache_ai.ingestion.reaper.lambda_handler
+      Handler: stache_ai_aws.reaper.lambda_handler
       Timeout: 300
       MemorySize: 256
       Layers:
