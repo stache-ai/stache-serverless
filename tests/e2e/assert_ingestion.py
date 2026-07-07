@@ -25,14 +25,32 @@ Scenarios:
   M. Concepts: enterprise concept extraction present for an async-ingested doc
   N. Producer S3 drop: object dropped to the originals bucket with x-amz-meta-stache-*
      -> S3 event -> worker creates a Job -> searchable (needs boto3 + bucket env)
+  O. Reserved-metadata sanitization (0.3, S4): caller-supplied `_`-prefixed keys
+     and a forged `content_hash` never survive into stored document metadata;
+     a legit caller key does (positive control)
+  P. Key escaping (0.3, S5): namespace/filename containing '#'/'%' round-trip
+     correctly, and a pair crafted to collide on the pre-0.3 unescaped
+     composite key do NOT cross-clobber each other
+  Q. Oversized-text 413: text over the configured inline cap is rejected with
+     413 (not 400/500); text just under the cap succeeds (boundary bracket)
+  R. Principal plumbing smoke: authenticated ingest -> GET round-trips the
+     caller's identity on a default (single-principal) OSS deploy. Authz-403
+     enforcement needs a plugged authorizer and is out of scope here
   H. Ownership: every job listed belongs to the calling principal
   I. Cleanup: permanent-delete created docs, verify search no longer finds them
+
+Scenarios O, P, Q, and R gate a DEFAULT OSS core deployment (no authorizer
+plugged in); they do not exercise authorization enforcement.
 
 Requires only stdlib. Config from stache-serverless/.env (deploy.sh --local-env)
 or the environment: STACHE_API_URL, STACHE_COGNITO_TOKEN_URL,
 STACHE_COGNITO_CLIENT_ID, STACHE_COGNITO_CLIENT_SECRET, STACHE_COGNITO_SCOPE.
 
 Exit code 0 = all assertions passed; 1 = failures (listed in the summary).
+
+Run offline (no deployed stack, no network) to sanity-check the new pure
+helpers introduced for the scenarios below:
+    python3 tests/e2e/assert_ingestion.py --selftest
 """
 
 import argparse
@@ -58,6 +76,18 @@ TRANSITIONS = {
 
 PASS, FAIL, WARN = "PASS", "FAIL", "WARN"
 results: list[tuple[str, str, str]] = []
+
+# Effective inline-text cap for scenario Q (0.3). The API layer enforces
+# min(config.max_ingest_text_bytes, jobstore.max_inline_payload_bytes); a
+# default OSS deploy uses the DynamoDB jobstore, whose 350_000-byte cap
+# (stache-ai-dynamodb/src/stache_ai_dynamodb/ingest_jobstore.py,
+# DynamoJobStore.max_inline_payload_bytes -- headroom under DynamoDB's 400KB
+# item limit) is stricter than the 10MiB app-level default
+# (stache-ai/src/stache_ai/config.py, Settings.max_ingest_text_bytes) and so
+# is the one that actually governs. Neither is exposed via
+# `deploy.sh --local-env`; if a future release adds an env override for it,
+# read that here in preference to the constant.
+INLINE_TEXT_CAP_BYTES = 350_000
 
 
 def check(name: str, ok: bool, detail: str = "", warn_only: bool = False):
@@ -307,6 +337,28 @@ def get_document(api: Api, doc_id: str, namespace: str):
         "GET", f"/api/documents/id/{doc_id}?namespace={urllib.parse.quote(namespace)}")
 
 
+def list_documents(api: Api, namespace: str) -> list:
+    """GET /api/documents?namespace=... (namespace may contain '#'/'%' — must
+    be percent-encoded or the '#' truncates the URL at a fragment before it
+    ever reaches the server, silently testing nothing)."""
+    code, body = api.request(
+        "GET", f"/api/documents?namespace={urllib.parse.quote(namespace, safe='')}&limit=200")
+    if code != 200:
+        return []
+    return body.get("documents") or []
+
+
+def _padded_text(total_bytes: int, marker: str) -> str:
+    """Build ASCII (1 byte/char) text of exactly ``total_bytes`` length with
+    ``marker`` embedded near the front, for tightly bracketing a byte-size cap.
+    """
+    prefix = f"Oversized-text probe {marker} boundary content. "
+    filler_needed = total_bytes - len(prefix)
+    if filler_needed < 0:
+        raise ValueError(f"prefix ({len(prefix)}B) longer than target size ({total_bytes}B)")
+    return prefix + ("x" * filler_needed)
+
+
 def poll_concepts(api: Api, namespace: str, doc_id: str, timeout: float = 30.0) -> list:
     """Concept extraction is a post-ingest step; allow brief eventual consistency."""
     deadline = time.time() + timeout
@@ -322,6 +374,89 @@ def poll_concepts(api: Api, namespace: str, doc_id: str, timeout: float = 30.0) 
     return []
 
 
+def _p_scenario_pairs(run_id: str, ns: str) -> dict:
+    """Namespace/filename pairs for scenario P (S5 key-escaping anti-collision).
+
+    Both pairs concatenate, via the pre-0.3 unescaped scheme
+    ``f"FILENAME#{namespace}#{filename}"`` (stache-ai-dynamodb's GSI2 key,
+    used by the DeduplicationGuard to look up "does a document already exist
+    at this namespace+filename?"), to the IDENTICAL string:
+
+        "FILENAME#" + ns_a + "#" + fn_a == "FILENAME#" + ns_b + "#" + fn_b
+
+    because the '#' that starts fn_a's prefix is exactly where ns_b's
+    trailing "#b" would otherwise land. Pre-0.3 this meant ingesting doc B
+    (different content) could be misread as an update to doc A: the
+    DeduplicationGuard sees "existing document at this identifier" with a
+    different content hash and triggers REINGEST_VERSION, which *soft-deletes*
+    doc A -- a document in a different logical namespace the caller for B
+    shouldn't be able to touch at all. 0.3 escapes '%' then '#' in namespace/
+    filename components before they enter the composite key, so the two no
+    longer collide.
+    """
+    ns_a = f"{ns}/a"
+    fn_a = f"b#re#port%1-{run_id}.txt"
+    ns_b = f"{ns}/a#b"
+    fn_b = f"re#port%1-{run_id}.txt"
+    return {"ns_a": ns_a, "fn_a": fn_a, "ns_b": ns_b, "fn_b": fn_b}
+
+
+def run_selftest() -> int:
+    """Offline sanity check for this file's new pure helpers (no network).
+
+    Covers the two helpers introduced for the 0.3 scenarios: ``_padded_text``
+    (scenario Q's byte-exact boundary bracketing) and the ``_p_scenario_pairs``
+    collision design (scenario P) -- proving, independent of any live stack,
+    that the crafted namespace/filename pairs actually collide under the
+    pre-0.3 unescaped concatenation scheme they're meant to regress-test.
+    """
+    failures = []
+
+    def _assert(label: str, ok: bool, detail: str = ""):
+        mark = "PASS" if ok else "FAIL"
+        print(f"  [{mark}] {label}" + (f" — {detail}" if detail and not ok else ""))
+        if not ok:
+            failures.append(label)
+
+    print("Offline self-test (no network, no deployed stack)")
+
+    # _padded_text: exact byte length, marker embedded, rejects too-small targets.
+    for size in (100, 1000, INLINE_TEXT_CAP_BYTES - 1, INLINE_TEXT_CAP_BYTES, INLINE_TEXT_CAP_BYTES + 1):
+        text = _padded_text(size, "m")
+        _assert(f"_padded_text({size}) yields exactly {size} bytes",
+                len(text.encode("utf-8")) == size, f"got {len(text.encode('utf-8'))}")
+    _assert("_padded_text('marker') embeds the marker",
+            "zzz-marker-zzz" in _padded_text(200, "zzz-marker-zzz"))
+    try:
+        _padded_text(3, "way too long a marker for 3 bytes")
+        _assert("_padded_text raises when the prefix exceeds the target size", False)
+    except ValueError:
+        _assert("_padded_text raises when the prefix exceeds the target size", True)
+
+    # _p_scenario_pairs: the pre-0.3 unescaped concatenation must collide.
+    pairs = _p_scenario_pairs("abcd1234", "e2e-selftest")
+    unescaped_a = f"FILENAME#{pairs['ns_a']}#{pairs['fn_a']}"
+    unescaped_b = f"FILENAME#{pairs['ns_b']}#{pairs['fn_b']}"
+    _assert("P pair: pre-0.3 unescaped GSI2 keys collide (the bug this regresses)",
+            unescaped_a == unescaped_b, f"{unescaped_a!r} != {unescaped_b!r}")
+    _assert("P pair: namespaces are themselves distinct strings",
+            pairs["ns_a"] != pairs["ns_b"])
+    _assert("P pair: filenames are themselves distinct strings",
+            pairs["fn_a"] != pairs["fn_b"])
+    # A minimal stand-in for the 0.3 escaper (escape '%' then '#') proves the
+    # fix actually separates them -- same algorithm as
+    # stache-ai-dynamodb's document_index._esc.
+    def _esc(s: str) -> str:
+        return s.replace("%", "%25").replace("#", "%23")
+    escaped_a = f"FILENAME#{_esc(pairs['ns_a'])}#{_esc(pairs['fn_a'])}"
+    escaped_b = f"FILENAME#{_esc(pairs['ns_b'])}#{_esc(pairs['fn_b'])}"
+    _assert("P pair: 0.3 escaping separates them",
+            escaped_a != escaped_b, f"{escaped_a!r} == {escaped_b!r}")
+
+    print(f"\n{len(failures)} failure(s)" if failures else "\nAll offline checks passed")
+    return 1 if failures else 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--env-file", default=str(Path(__file__).resolve().parents[2] / ".env"))
@@ -329,7 +464,12 @@ def main():
     ap.add_argument("--timeout", type=float, default=180.0, help="per-job poll timeout (s)")
     ap.add_argument("--skip-presign", action="store_true")
     ap.add_argument("--keep", action="store_true", help="skip cleanup (leave e2e docs behind)")
+    ap.add_argument("--selftest", action="store_true",
+                     help="run offline checks of new pure helpers only; no network, no .env")
     args = ap.parse_args()
+
+    if args.selftest:
+        return run_selftest()
 
     load_env(Path(args.env_file))
     base_url = args.base_url or os.environ.get("STACHE_API_URL")
@@ -640,6 +780,170 @@ def main():
             check("producer drop: S3 event -> worker created job -> searchable", found,
                   "producer-dropped object never became searchable")
 
+    # O ─ reserved-metadata sanitization (0.3, S4) --------------------------------
+    section("O. Reserved-metadata sanitization (S4)")
+    # Caller-supplied `_`-prefixed keys and a caller-supplied `content_hash`
+    # must be stripped at the API boundary (stache_ai.sanitize.strip_reserved_
+    # metadata) before routes/guards write their own internal-control state --
+    # otherwise a caller could forge dedup/error-recovery state (e.g. point
+    # `_previous_doc_id` at someone else's document).
+    #
+    # NOTE on content_hash: with dedup_enabled=true (the OSS default), the
+    # DeduplicationGuard legitimately RE-ADDS its own server-computed
+    # content_hash to the stored metadata (see rag/pipeline.py's
+    # "clean_metadata" construction, which explicitly keeps content_hash while
+    # dropping every other underscore/reserved key). So "content_hash absent"
+    # does not hold in general -- the meaningful, forgery-proof assertion is
+    # that the CALLER'S forged value never survives, which is what the guard's
+    # real hash overwriting it (post-strip) actually proves.
+    o_forged_hash = "forged-" + uuid.uuid4().hex
+    o_author = f"author-{run_id}"
+    code, ojob = api.request("POST", "/api/ingest", {
+        "namespace": ns, "text": f"Sanitization probe {sentinel}-sanitize content.",
+        "content_type": "text", "wait": True, "filename": f"e2e-sanitize-{run_id}",
+        "metadata": {
+            "author": o_author,
+            "_stamped": "attacker-supplied-internal-state",
+            "content_hash": o_forged_hash,
+        },
+    })
+    check("sanitize: submit accepted", code in (200, 202), f"got {code}: {ojob}")
+    check("sanitize: ingest terminal == done", ojob.get("status") == "done",
+          f"status={ojob.get('status')}")
+    if ojob.get("doc_id"):
+        created_docs.append((ojob["doc_id"], ns))
+        _, odoc = get_document(api, ojob["doc_id"], ns)
+        omd = odoc.get("metadata") or {}
+        check("sanitize: positive control - legit 'author' key survived",
+              omd.get("author") == o_author, f"metadata={omd}")
+        check("sanitize: caller's underscore-prefixed key stripped ('_stamped' absent)",
+              "_stamped" not in omd, f"metadata={omd}")
+        check("sanitize: caller-forged 'content_hash' value did not survive",
+              omd.get("content_hash") != o_forged_hash, f"metadata={omd}")
+    else:
+        check("sanitize: doc_id populated", False, str(ojob))
+
+    # P ─ key escaping (0.3, S5) ---------------------------------------------------
+    section("P. Key escaping & anti-collision (S5)")
+    p = _p_scenario_pairs(run_id, ns)
+    sentinel_p1, sentinel_p2 = f"{sentinel}-p1", f"{sentinel}-p2"
+
+    code, p1job = api.request("POST", "/api/ingest", {
+        "namespace": p["ns_a"], "text": f"Key-escaping doc one: {sentinel_p1} content.",
+        "content_type": "text", "wait": True, "filename": p["fn_a"],
+    })
+    check("P: doc A (namespace/filename with '#') submit accepted",
+          code in (200, 202), f"got {code}: {p1job}")
+    check("P: doc A terminal == done", p1job.get("status") == "done",
+          f"status={p1job.get('status')}")
+    doc_id_p1 = p1job.get("doc_id")
+    if doc_id_p1:
+        created_docs.append((doc_id_p1, p["ns_a"]))
+
+    code, p2job = api.request("POST", "/api/ingest", {
+        "namespace": p["ns_b"], "text": f"Key-escaping doc two: {sentinel_p2} content.",
+        "content_type": "text", "wait": True, "filename": p["fn_b"],
+    })
+    check("P: doc B (sibling namespace crafted to collide pre-0.3) submit accepted",
+          code in (200, 202), f"got {code}: {p2job}")
+    check("P: doc B terminal == done (not skipped/reingested as an update to doc A)",
+          p2job.get("status") == "done", f"status={p2job.get('status')}")
+    doc_id_p2 = p2job.get("doc_id")
+    if doc_id_p2:
+        created_docs.append((doc_id_p2, p["ns_b"]))
+
+    # Positive control: each doc independently retrievable by id in its own namespace.
+    if doc_id_p1:
+        c1, d1 = get_document(api, doc_id_p1, p["ns_a"])
+        check("P: doc A retrievable by id (positive control)",
+              c1 == 200 and d1.get("filename") == p["fn_a"], f"code={c1} doc={d1}")
+    if doc_id_p2:
+        c2, d2 = get_document(api, doc_id_p2, p["ns_b"])
+        check("P: doc B retrievable by id (positive control)",
+              c2 == 200 and d2.get("filename") == p["fn_b"], f"code={c2} doc={d2}")
+
+    # Anti-forgery: doc A must not have been silently soft-deleted/overwritten
+    # by ingesting doc B under the colliding identifier (the pre-0.3 bug: a
+    # different-content doc at the colliding key trips the DeduplicationGuard's
+    # REINGEST_VERSION path, which soft-deletes what it thinks is "the same
+    # document" -- here, actually a different document in a different namespace).
+    check("P: doc A still searchable in its own namespace after doc B ingests "
+          "(not clobbered by the crafted collision)",
+          found_sentinel(search(api, sentinel_p1, p["ns_a"]), sentinel_p1),
+          "doc A's content vanished — collision not prevented")
+    check("P: doc B searchable in its own namespace",
+          found_sentinel(search_until(api, sentinel_p2, p["ns_b"]), sentinel_p2), "no hits")
+    # No cross-fetch: each doc's content only shows up under its OWN namespace.
+    check("P: doc A's content does not leak into doc B's namespace",
+          not found_sentinel(search(api, sentinel_p1, p["ns_b"]), sentinel_p1),
+          "cross-namespace leak")
+    check("P: doc B's content does not leak into doc A's namespace",
+          not found_sentinel(search(api, sentinel_p2, p["ns_a"]), sentinel_p2),
+          "cross-namespace leak")
+
+    # Listing: each namespace's document list contains only its own doc.
+    if doc_id_p1 and doc_id_p2:
+        ids_a = {d.get("doc_id") for d in list_documents(api, p["ns_a"])}
+        ids_b = {d.get("doc_id") for d in list_documents(api, p["ns_b"])}
+        check("P: namespace A listing contains doc A, not doc B",
+              doc_id_p1 in ids_a and doc_id_p2 not in ids_a, f"ids_a={ids_a}")
+        check("P: namespace B listing contains doc B, not doc A",
+              doc_id_p2 in ids_b and doc_id_p1 not in ids_b, f"ids_b={ids_b}")
+
+    # Q ─ oversized-text 413 (boundary bracket) ------------------------------------
+    section("Q. Oversized-text 413 (boundary bracket)")
+    over_text = _padded_text(INLINE_TEXT_CAP_BYTES + 1, f"{sentinel}-oversize")
+    code, over_body = api.request("POST", "/api/ingest", {
+        "namespace": ns, "text": over_text, "content_type": "text",
+        "filename": f"e2e-oversize-{run_id}",
+    })
+    check(f"oversized text ({INLINE_TEXT_CAP_BYTES + 1}B, cap+1) rejected with 413",
+          code == 413, f"got {code}: {over_body}")
+
+    under_text = _padded_text(INLINE_TEXT_CAP_BYTES - 1, f"{sentinel}-underize")
+    code, qjob = api.request("POST", "/api/ingest", {
+        "namespace": ns, "text": under_text, "content_type": "text",
+        "filename": f"e2e-underize-{run_id}",
+    })
+    check(f"just-under-cap text ({INLINE_TEXT_CAP_BYTES - 1}B, cap-1) accepted (not 413)",
+          code in (200, 202), f"got {code}: {qjob}")
+    if qjob.get("job_id") and qjob.get("status") not in TERMINAL:
+        qjob, qobs, qerr = poll_job(api, qjob["job_id"], max(args.timeout, 240))
+    else:
+        qobs, qerr = [qjob.get("status")], []
+    assert_terminal_job("oversized-boundary (under-cap) ingest", qjob, qobs, qerr, "done")
+    if qjob.get("doc_id"):
+        created_docs.append((qjob["doc_id"], ns))
+    check("under-cap text: content retrievable (positive control — the cap "
+          "isn't just rejecting everything)",
+          found_sentinel(search_until(api, f"{sentinel}-underize", ns), f"{sentinel}-underize"),
+          "no hits")
+
+    # R ─ principal plumbing smoke -------------------------------------------------
+    section("R. Principal plumbing smoke")
+    # Default OSS has a single principal and no plugged authorizer, so there is
+    # no authz-403 to enforce here; that behavior (a second principal denied
+    # access to a namespace it doesn't own) belongs to the test suite of
+    # whichever authorizer is plugged in.
+    # This scenario only proves the identity plumbing works end to end: the
+    # token's principal rides through ingest -> job -> GET.
+    code, rjob = api.request("POST", "/api/ingest", {
+        "namespace": ns, "text": f"Principal smoke {sentinel}-principal content.",
+        "content_type": "text", "wait": True, "filename": f"e2e-principal-{run_id}",
+    })
+    check("principal: submit accepted", code in (200, 202), f"got {code}: {rjob}")
+    check("principal: wait=true returns terminal in one call",
+          rjob.get("status") in TERMINAL, f"status={rjob.get('status')}")
+    check("principal: job carries the calling principal as requested_by",
+          rjob.get("requested_by") == sub, f"requested_by={rjob.get('requested_by')!r} sub={sub!r}")
+    if rjob.get("doc_id"):
+        created_docs.append((rjob["doc_id"], ns))
+        rcode, rdoc = get_document(api, rjob["doc_id"], ns)
+        check("principal: authenticated GET of the ingested doc round-trips (200)",
+              rcode == 200 and rdoc.get("namespace") == ns, f"code={rcode} doc={rdoc}")
+    else:
+        check("principal: doc_id populated", False, str(rjob))
+
     # H ─ ownership --------------------------------------------------------------
     section("H. Ownership scoping")
     code, listing = api.request("GET", "/api/jobs?limit=50")
@@ -657,8 +961,12 @@ def main():
     if not args.keep:
         section("I. Cleanup")
         for doc_id, dns in created_docs:
+            # Percent-encode: scenario P registers namespaces containing '#',
+            # which (unescaped) truncates the URL at a fragment client-side
+            # and never reaches the server, silently leaking the doc.
             code, _ = api.request(
-                "DELETE", f"/api/documents/id/{doc_id}?namespace={dns}&permanent=true")
+                "DELETE", f"/api/documents/id/{doc_id}"
+                          f"?namespace={urllib.parse.quote(dns, safe='')}&permanent=true")
             check(f"deleted {doc_id[:8]}…", code == 200, f"got {code}")
         time.sleep(3)
         hits = search(api, sentinel, ns)
