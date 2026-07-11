@@ -69,9 +69,29 @@ Parameters:
     Type: CommaDelimitedList
     Description: Allowed origins for presigned-upload CORS on OriginalsBucket (app + mobile origins). Default "*" keeps dev simple; pin origins in prod.
     Default: "*"
+  EnableAdminPasswordAuth:
+    Type: String
+    Description: >-
+      Adds ALLOW_ADMIN_USER_PASSWORD_AUTH to the web user pool client so an
+      automated end-to-end test harness can sign throwaway test users in
+      programmatically, with no browser. Off unless explicitly requested.
+
+      Only the ADMIN variant is offered. ALLOW_USER_PASSWORD_AUTH is deliberately
+      NOT available here: this client has no secret and its id ships in the
+      frontend bundle, so that flow would expose plaintext username/password
+      credential stuffing directly at the public InitiateAuth endpoint.
+      ADMIN_USER_PASSWORD_AUTH is only usable via AdminInitiateAuth, which
+      requires AWS IAM credentials and is not reachable from the internet.
+
+      SRP and refresh-token auth remain enabled either way.
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "false"
 Conditions:
   UseCustomDomain: !Not [!Equals [!Ref AppDomain, ""]]
   HasEnterpriseLayer: !Not [!Equals [!Ref EnterpriseLayerArn, ""]]
+  UseAdminPasswordAuth: !Equals [!Ref EnableAdminPasswordAuth, "true"]
 
 Globals:
   Function:
@@ -406,6 +426,8 @@ Resources:
       ExplicitAuthFlows:
         - ALLOW_USER_SRP_AUTH
         - ALLOW_REFRESH_TOKEN_AUTH
+        # Admin-only password auth, for the e2e harness. See EnableAdminPasswordAuth.
+        - !If [UseAdminPasswordAuth, ALLOW_ADMIN_USER_PASSWORD_AUTH, !Ref "AWS::NoValue"]
       AllowedOAuthFlows:
         - code
         - implicit

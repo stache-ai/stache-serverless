@@ -16,6 +16,10 @@ set -e
 #   --from-source [path]        Build from local source instead of PyPI (default: ../stache)
 #   --embedding-model <model>   Bedrock embedding model id (default: cohere.embed-english-v3)
 #                               Use cohere.embed-v4:0 to select Embed v4.
+#   --enable-admin-password-auth   Enable ALLOW_ADMIN_USER_PASSWORD_AUTH on the web user
+#                               pool client, so the e2e harness can sign test users in
+#                               programmatically (via AdminInitiateAuth, IAM-gated).
+#   --disable-admin-password-auth  Turn that flow back off.
 #   --local-env [file]          Output .env file for local development (skips deploy)
 #   -h, --help                  Show this help message
 #
@@ -25,6 +29,14 @@ set -e
 #   STACHE_BEDROCK_EMBEDDING_MODEL  Same as --embedding-model
 #   STACHE_LLM_PROVIDER         LLM provider name to resolve at runtime (default: bedrock)
 #   STACHE_EMBEDDING_PROVIDER   Embedding provider name to resolve at runtime (default: bedrock)
+#   STACHE_ENABLE_ADMIN_PASSWORD_AUTH  "true"/"false", same as the flags above
+#
+# STACK PARAMETERS ARE STICKY.
+#   sam deploy resolves any parameter it is NOT given to the TEMPLATE DEFAULT, not
+#   to the stack's current value, so omitting a flag on a redeploy would otherwise
+#   silently revert it. The four settings above (providers, embedding model, admin
+#   password auth) are therefore re-read from the deployed stack and re-sent when
+#   you do not pass them. Passing a flag / env var still wins.
 #
 # CHANGING THE EMBEDDING MODEL IS A RE-INDEX, NOT A CONFIG TWEAK.
 #   Embed v3 and Embed v4 produce vectors in different embedding spaces. Pointing
@@ -122,6 +134,16 @@ while [[ $# -gt 0 ]]; do
             # BedrockEmbeddingModel stack parameter.
             export STACHE_BEDROCK_EMBEDDING_MODEL="$2"
             shift 2
+            ;;
+        --enable-admin-password-auth)
+            # Exported so build_sam_params (lib/common.sh) forwards it as the
+            # EnableAdminPasswordAuth stack parameter.
+            export STACHE_ENABLE_ADMIN_PASSWORD_AUTH="true"
+            shift
+            ;;
+        --disable-admin-password-auth)
+            export STACHE_ENABLE_ADMIN_PASSWORD_AUTH="false"
+            shift
             ;;
         --local-env)
             # Check if next arg is a file path or another flag
