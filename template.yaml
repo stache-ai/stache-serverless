@@ -312,6 +312,15 @@ Resources:
   # Cognito User Pool for authentication
   UserPool:
     Type: AWS::Cognito::UserPool
+    # The pool holds every user account; losing it is unrecoverable. Several of
+    # the properties below are immutable in Cognito (UsernameAttributes, Schema
+    # -- which is where the custom attributes live), so an innocuous-looking
+    # edit makes CloudFormation REPLACE the pool. Retain covers both ways that
+    # goes wrong: DeletionPolicy for a stack delete/rollback, UpdateReplacePolicy
+    # for a replacement. Without the latter a replacement deletes the old pool
+    # and every user in it. Retain orphans the pool instead -- recoverable.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       UserPoolName: !Sub '${AWS::StackName}-users'
       AdminCreateUserConfig:
