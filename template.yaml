@@ -9,6 +9,41 @@ Parameters:
     Default: "stache"
     AllowedPattern: "^[a-z][a-z0-9-]*$"
     ConstraintDescription: Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens
+  BedrockEmbeddingModel:
+    Type: String
+    Description: >-
+      Bedrock embedding model id. Defaults to Cohere Embed v3 so existing
+      deployments keep the model their vectors were embedded with.
+
+      WARNING: this is NOT safe to change on a populated vector index. Embed v3
+      and v4 produce vectors in different embedding spaces, so querying
+      v3-embedded vectors with a v4 query returns meaningless results. Changing
+      it means re-embedding every document. Only set this on a fresh deployment,
+      or as part of a deliberate re-index.
+
+      Embed v4 (cohere.embed-v4:0) supports Matryoshka output dimensions; keep
+      EmbeddingDimension at 1024 to match the dimension the S3 Vectors indexes
+      are created with.
+    Default: "cohere.embed-english-v3"
+  LlmProvider:
+    Type: String
+    Description: >-
+      Name of the LLM provider to resolve at runtime (LLM_PROVIDER). Defaults to
+      the built-in "bedrock" provider.
+
+      This is a parameter rather than a hardcoded value so that an extension
+      layer (see EnterpriseLayerArn) can supply a different provider
+      implementation and have it survive a redeploy. CloudFormation replaces the
+      whole Lambda environment on every deploy, so a provider name applied
+      out-of-band would otherwise be silently reverted to the template default.
+    Default: "bedrock"
+  EmbeddingProvider:
+    Type: String
+    Description: >-
+      Name of the embedding provider to resolve at runtime (EMBEDDING_PROVIDER).
+      Defaults to the built-in "bedrock" provider. See LlmProvider for why this
+      is parameterized.
+    Default: "bedrock"
   AppDomain:
     Type: String
     Description: Custom domain for the application (optional)
@@ -19,7 +54,16 @@ Parameters:
     Default: ""
   EnterpriseLayerArn:
     Type: String
-    Description: Optional enterprise extension layer ARN (from stache-enterprise stack)
+    Description: >-
+      Optional enterprise extension layer ARN, attached alongside the core
+      StacheLayer on the functions that run the RAG pipeline.
+
+      This MUST be a layer that is deduplicated against the core layer (the
+      enterprise stack's slim layer output), NOT a self-contained "fat" layer
+      that re-bundles what the core layer already ships. Lambda caps function
+      code plus all layers at 250 MB unzipped; the core layer alone is ~124 MB,
+      so a fat extension layer breaches the limit and the deploy fails with
+      "Function code combined with layers exceeds the maximum allowed size".
     Default: ""
   UploadCorsOrigins:
     Type: CommaDelimitedList
@@ -39,8 +83,13 @@ Globals:
     Environment:
       Variables:
         # Provider Configuration
-        LLM_PROVIDER: bedrock
-        EMBEDDING_PROVIDER: bedrock
+        # LLM_PROVIDER / EMBEDDING_PROVIDER are parameterized so an extension
+        # layer can supply its own provider names. Do NOT hardcode them back to
+        # "bedrock": CloudFormation rewrites the entire Lambda environment on
+        # every deploy, so a hardcoded value silently reverts whatever the
+        # extension applied out-of-band.
+        LLM_PROVIDER: !Ref LlmProvider
+        EMBEDDING_PROVIDER: !Ref EmbeddingProvider
         VECTORDB_PROVIDER: s3vectors
         NAMESPACE_PROVIDER: dynamodb
         DOCUMENT_INDEX_PROVIDER: dynamodb
@@ -49,7 +98,7 @@ Globals:
         # AWS Provider Settings (AWS_REGION is automatically set by Lambda)
         BEDROCK_LLM_MODEL: us.amazon.nova-pro-v1:0
         BEDROCK_ENRICHMENT_MODEL: us.amazon.nova-lite-v1:0
-        BEDROCK_EMBEDDING_MODEL: cohere.embed-english-v3
+        BEDROCK_EMBEDDING_MODEL: !Ref BedrockEmbeddingModel
         S3VECTORS_BUCKET: !Sub '${ResourcePrefix}-vectors-${AWS::AccountId}'
         S3VECTORS_INDEX: !Sub '${ResourcePrefix}-vectors'
         S3VECTORS_DOCUMENTS_INDEX: !Sub '${ResourcePrefix}-documents'
@@ -60,6 +109,9 @@ Globals:
 
         # General Settings
         LOG_LEVEL: info
+        # Must stay in step with the S3 Vectors indexes' Dimension (1024).
+        # Embed v4 is Matryoshka-capable but is asked for 1024 so it matches the
+        # index the v3 vectors were written to.
         EMBEDDING_DIMENSION: "1024"
         CHUNK_SIZE: "1000"
         CHUNK_OVERLAP: "100"
