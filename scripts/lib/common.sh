@@ -148,6 +148,10 @@ get_existing_domain_config() {
 }
 
 # Build SAM parameter string
+# Writes the parameter string to stdout; all human-facing output goes to stderr
+# because callers capture stdout via $(...).
+# Returns non-zero if the enterprise stack exists but only exposes a layer that
+# cannot safely be attached to the core functions (see below).
 build_sam_params() {
     local params="ResourcePrefix=$RESOURCE_PREFIX"
 
@@ -158,12 +162,58 @@ build_sam_params() {
         params="$params CertificateArn=$CERT_ARN"
     fi
 
-    # Check for enterprise stack and add layer ARN if exists
+    # Provider names and the embedding model are parameterized rather than
+    # hardcoded in the template: CloudFormation rewrites the whole Lambda
+    # environment on every deploy, so anything applied out-of-band is otherwise
+    # silently reverted to the template default. Forward them from the
+    # environment when set; the template defaults apply when unset.
+    if [[ -n "${STACHE_LLM_PROVIDER:-}" ]]; then
+        params="$params LlmProvider=$STACHE_LLM_PROVIDER"
+        print_success "LLM provider: $STACHE_LLM_PROVIDER" >&2
+    fi
+    if [[ -n "${STACHE_EMBEDDING_PROVIDER:-}" ]]; then
+        params="$params EmbeddingProvider=$STACHE_EMBEDDING_PROVIDER"
+        print_success "Embedding provider: $STACHE_EMBEDDING_PROVIDER" >&2
+    fi
+    if [[ -n "${STACHE_BEDROCK_EMBEDDING_MODEL:-}" ]]; then
+        params="$params BedrockEmbeddingModel=$STACHE_BEDROCK_EMBEDDING_MODEL"
+        print_success "Bedrock embedding model: $STACHE_BEDROCK_EMBEDDING_MODEL" >&2
+    fi
+
+    # Check for an enterprise stack and attach its extension layer if present.
+    #
+    # We consume EnterpriseSlimLayerArn -- the layer deduplicated against the
+    # core layer (~2 MB). We must NOT consume EnterpriseLayerArn: that is the
+    # enterprise stack's self-contained "fat" layer (~112 MB), built for the
+    # enterprise stack's OWN functions, which already re-bundles everything the
+    # core layer ships. Lambda caps function code plus all layers at 250 MB
+    # unzipped and the core layer alone is ~124 MB, so attaching the fat layer
+    # to a core function blows the limit and the deploy fails with:
+    #   Function code combined with layers exceeds the maximum allowed size
+    #   of 262144000 bytes.
+    # There is deliberately no fallback to the fat layer.
     local enterprise_stack="${RESOURCE_PREFIX}-enterprise"
-    local enterprise_layer_arn=$(get_stack_output "$enterprise_stack" "EnterpriseLayerArn")
-    if [[ -n "$enterprise_layer_arn" ]] && [[ "$enterprise_layer_arn" != "None" ]]; then
-        params="$params EnterpriseLayerArn=$enterprise_layer_arn"
-        print_success "Found enterprise layer: $enterprise_layer_arn" >&2
+    local slim_layer_arn
+    slim_layer_arn=$(get_stack_output "$enterprise_stack" "EnterpriseSlimLayerArn")
+
+    if [[ -n "$slim_layer_arn" ]] && [[ "$slim_layer_arn" != "None" ]]; then
+        params="$params EnterpriseLayerArn=$slim_layer_arn"
+        print_success "Found enterprise slim layer: $slim_layer_arn" >&2
+    elif stack_exists "$enterprise_stack"; then
+        # The enterprise stack is deployed but predates the slim layer. Fail
+        # loudly rather than silently attaching a layer that cannot fit.
+        local fat_layer_arn
+        fat_layer_arn=$(get_stack_output "$enterprise_stack" "EnterpriseLayerArn")
+        if [[ -n "$fat_layer_arn" ]] && [[ "$fat_layer_arn" != "None" ]]; then
+            print_error "Enterprise stack '$enterprise_stack' exposes no EnterpriseSlimLayerArn output." >&2
+            echo "  It only exposes the self-contained EnterpriseLayerArn:" >&2
+            echo "    $fat_layer_arn" >&2
+            echo "  That layer is for the enterprise stack's own functions. Attaching it to a" >&2
+            echo "  core function exceeds Lambda's 250MB code+layers limit and the deploy fails." >&2
+            echo "  Redeploy the enterprise stack so it publishes EnterpriseSlimLayerArn." >&2
+            return 1
+        fi
+        print_warning "Enterprise stack '$enterprise_stack' exists but exposes no layer output" >&2
     fi
 
     echo "$params"
@@ -171,7 +221,10 @@ build_sam_params() {
 
 # Deploy SAM stack
 deploy_sam_stack() {
-    local params=$(build_sam_params)
+    # Declare and assign separately: `local params=$(...)` would mask a non-zero
+    # exit status from build_sam_params behind `local`'s own success.
+    local params
+    params=$(build_sam_params) || return 1
 
     print_header "Deploying to AWS"
     sam deploy \

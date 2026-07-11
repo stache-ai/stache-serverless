@@ -14,12 +14,27 @@ set -e
 #   -s, --sam-only              Just run sam deploy (skip layer, sam build, frontend)
 #   -l, --layer-only            Rebuild layer and deploy (skip sam build, frontend)
 #   --from-source [path]        Build from local source instead of PyPI (default: ../stache)
+#   --embedding-model <model>   Bedrock embedding model id (default: cohere.embed-english-v3)
+#                               Use cohere.embed-v4:0 to select Embed v4.
 #   --local-env [file]          Output .env file for local development (skips deploy)
 #   -h, --help                  Show this help message
 #
 # Environment variables:
 #   RESOURCE_PREFIX             Same as --prefix
 #   STACHE_FROM_SOURCE          Set to path to build from source (or "true" for default path)
+#   STACHE_BEDROCK_EMBEDDING_MODEL  Same as --embedding-model
+#   STACHE_LLM_PROVIDER         LLM provider name to resolve at runtime (default: bedrock)
+#   STACHE_EMBEDDING_PROVIDER   Embedding provider name to resolve at runtime (default: bedrock)
+#
+# CHANGING THE EMBEDDING MODEL IS A RE-INDEX, NOT A CONFIG TWEAK.
+#   Embed v3 and Embed v4 produce vectors in different embedding spaces. Pointing
+#   a POPULATED vector index at a new embedding model does not migrate anything:
+#   the stored vectors stay as they were, and querying v3 vectors with a v4 query
+#   embedding returns meaningless results (no error, just silently bad matches).
+#   Only change this on a fresh deployment, or as part of a deliberate re-index in
+#   which every document is re-embedded with the new model.
+#   Keep the output dimension at 1024 either way -- it must match the Dimension the
+#   S3 Vectors indexes were created with, and changing that replaces the indexes.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -46,8 +61,11 @@ if [[ -n "$STACHE_FROM_SOURCE" ]]; then
     fi
 fi
 
+# Print the header comment block (everything from the title down to the first
+# blank line), with the leading "# " stripped. Beats hardcoded line offsets,
+# which silently truncate the help text whenever the header grows.
 show_help() {
-    head -19 "$0" | tail -15
+    sed -n '4,/^$/p' "$0" | sed 's/^#\( \|$\)//'
     exit 0
 }
 
@@ -98,6 +116,12 @@ while [[ $# -gt 0 ]]; do
                 FROM_SOURCE="../stache"
                 shift
             fi
+            ;;
+        --embedding-model)
+            # Exported so build_sam_params (lib/common.sh) forwards it as the
+            # BedrockEmbeddingModel stack parameter.
+            export STACHE_BEDROCK_EMBEDDING_MODEL="$2"
+            shift 2
             ;;
         --local-env)
             # Check if next arg is a file path or another flag
