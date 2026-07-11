@@ -211,6 +211,35 @@ get_existing_domain_config() {
 # Returns non-zero if the enterprise stack exists but only exposes a layer that
 # cannot safely be attached to the core functions (see below).
 build_sam_params() {
+    # ResourcePrefix names nearly every resource in the stack, and for the ones
+    # with a physical name (DynamoDB TableName, the S3 Vectors bucket) a changed
+    # name is a REPLACEMENT, not a rename: CloudFormation builds new, empty
+    # resources and abandons the old ones. So a deploy that quietly picks a
+    # different prefix than the one already deployed silently strands the data.
+    #
+    # The stack name is fixed, so there is exactly one core stack per account and
+    # a prefix change on it is never what anyone meant -- it is a forgotten
+    # --prefix. Refuse rather than guess. (Unlike the sticky params below we do
+    # NOT silently adopt the deployed value: the operator asked for a specific
+    # prefix, and quietly ignoring that is its own surprise.)
+    local deployed_prefix
+    deployed_prefix=$(get_stack_parameter "$STACK_NAME" "ResourcePrefix" 2>/dev/null) || true
+    if [[ -n "$deployed_prefix" && "$deployed_prefix" != "None" \
+          && "$deployed_prefix" != "$RESOURCE_PREFIX" ]]; then
+        print_error "Refusing to deploy: resource prefix mismatch." >&2
+        echo "  Stack '$STACK_NAME' is deployed with ResourcePrefix=$deployed_prefix" >&2
+        echo "  but this run resolved ResourcePrefix=$RESOURCE_PREFIX." >&2
+        echo "" >&2
+        echo "  Deploying would RENAME the stack's resources. For anything with a" >&2
+        echo "  physical name (the DynamoDB tables, the S3 Vectors bucket) a rename" >&2
+        echo "  is a REPLACEMENT: CloudFormation would create new, empty resources" >&2
+        echo "  and abandon the ones holding your data." >&2
+        echo "" >&2
+        echo "  You almost certainly just omitted --prefix. Re-run with:" >&2
+        echo "      $0 --prefix $deployed_prefix <other args>" >&2
+        return 1
+    fi
+
     local params="ResourcePrefix=$RESOURCE_PREFIX"
 
     if [[ -n "${DOMAIN:-}" ]] && [[ "$DOMAIN" != "None" ]]; then
