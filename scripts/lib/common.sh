@@ -89,6 +89,64 @@ stack_exists() {
     aws cloudformation describe-stacks --stack-name "$stack_name" --region "$AWS_REGION" &>/dev/null
 }
 
+# Does the main stack ($STACK_NAME) exist? Cached: the sticky-parameter
+# resolution below asks once per parameter and there is no point re-describing
+# the stack each time.
+_MAIN_STACK_EXISTS_CHECKED=""
+_MAIN_STACK_EXISTS_RESULT=1
+
+main_stack_exists() {
+    if [[ -z "$_MAIN_STACK_EXISTS_CHECKED" ]]; then
+        _MAIN_STACK_EXISTS_CHECKED=1
+        if stack_exists "$STACK_NAME"; then
+            _MAIN_STACK_EXISTS_RESULT=0
+        else
+            _MAIN_STACK_EXISTS_RESULT=1
+        fi
+    fi
+    return "$_MAIN_STACK_EXISTS_RESULT"
+}
+
+# Resolve a STICKY stack parameter, writing the resolved value to stdout (empty
+# if nothing resolves, meaning: pass nothing and let the template default win).
+#
+# Why this exists: `sam deploy` resolves every parameter it is NOT explicitly
+# given to the TEMPLATE DEFAULT -- NOT to the value currently deployed on the
+# stack. So a routine redeploy that merely omits a flag silently reverts that
+# parameter to its default, and CloudFormation then applies that as a real
+# change (it has already cost us a silently deleted DynamoDB GSI in a sibling
+# stack). For the parameters below the failure is worse than a crash: reverting
+# BedrockEmbeddingModel from cohere.embed-v4:0 to the v3 default against an index
+# populated with v4 vectors returns meaningless search results with no error,
+# because the two models embed into different vector spaces.
+#
+# Precedence:
+#   1. operator intent -- env var / CLI flag, if provided
+#   2. the value currently deployed on the stack
+#   3. the template default (fresh stack, or parameter not yet on the stack)
+resolve_sticky_param() {
+    local param_key="$1"
+    local override="${2:-}"
+
+    if [[ -n "$override" ]]; then
+        echo "$override"
+        return 0
+    fi
+
+    # No stack yet: nothing to preserve, let the template default apply.
+    main_stack_exists || return 0
+
+    # Declare and assign separately so the assignment's exit status is not
+    # masked by `local`'s own success.
+    local deployed
+    deployed=$(get_stack_parameter "$STACK_NAME" "$param_key")
+
+    # Empty/None also covers a parameter that the deployed stack predates.
+    if [[ -n "$deployed" ]] && [[ "$deployed" != "None" ]]; then
+        echo "$deployed"
+    fi
+}
+
 # Get certificate status
 get_certificate_status() {
     local cert_arn="$1"
@@ -165,19 +223,40 @@ build_sam_params() {
     # Provider names and the embedding model are parameterized rather than
     # hardcoded in the template: CloudFormation rewrites the whole Lambda
     # environment on every deploy, so anything applied out-of-band is otherwise
-    # silently reverted to the template default. Forward them from the
-    # environment when set; the template defaults apply when unset.
-    if [[ -n "${STACHE_LLM_PROVIDER:-}" ]]; then
-        params="$params LlmProvider=$STACHE_LLM_PROVIDER"
-        print_success "LLM provider: $STACHE_LLM_PROVIDER" >&2
+    # silently reverted to the template default.
+    #
+    # These are STICKY: the env var wins if set, otherwise we re-send whatever is
+    # already deployed on the stack, so a plain `./scripts/deploy.sh` with no env
+    # vars cannot quietly reset them. See resolve_sticky_param for the full why.
+    # (AppDomain/CertificateArn above are already made sticky by
+    # get_existing_domain_config, which seeds DOMAIN/CERT_ARN from the stack.)
+    local llm_provider embedding_provider embedding_model admin_password_auth
+
+    llm_provider=$(resolve_sticky_param "LlmProvider" "${STACHE_LLM_PROVIDER:-}")
+    if [[ -n "$llm_provider" ]]; then
+        params="$params LlmProvider=$llm_provider"
+        print_success "LLM provider: $llm_provider" >&2
     fi
-    if [[ -n "${STACHE_EMBEDDING_PROVIDER:-}" ]]; then
-        params="$params EmbeddingProvider=$STACHE_EMBEDDING_PROVIDER"
-        print_success "Embedding provider: $STACHE_EMBEDDING_PROVIDER" >&2
+
+    embedding_provider=$(resolve_sticky_param "EmbeddingProvider" "${STACHE_EMBEDDING_PROVIDER:-}")
+    if [[ -n "$embedding_provider" ]]; then
+        params="$params EmbeddingProvider=$embedding_provider"
+        print_success "Embedding provider: $embedding_provider" >&2
     fi
-    if [[ -n "${STACHE_BEDROCK_EMBEDDING_MODEL:-}" ]]; then
-        params="$params BedrockEmbeddingModel=$STACHE_BEDROCK_EMBEDDING_MODEL"
-        print_success "Bedrock embedding model: $STACHE_BEDROCK_EMBEDDING_MODEL" >&2
+
+    embedding_model=$(resolve_sticky_param "BedrockEmbeddingModel" "${STACHE_BEDROCK_EMBEDDING_MODEL:-}")
+    if [[ -n "$embedding_model" ]]; then
+        params="$params BedrockEmbeddingModel=$embedding_model"
+        print_success "Bedrock embedding model: $embedding_model" >&2
+    fi
+
+    # Admin-only password auth flow on the web user pool client (e2e harness).
+    # Sticky too: once an operator has turned it on (or off), a redeploy that
+    # does not mention it must not flip it back.
+    admin_password_auth=$(resolve_sticky_param "EnableAdminPasswordAuth" "${STACHE_ENABLE_ADMIN_PASSWORD_AUTH:-}")
+    if [[ -n "$admin_password_auth" ]]; then
+        params="$params EnableAdminPasswordAuth=$admin_password_auth"
+        print_success "Admin password auth flow: $admin_password_auth" >&2
     fi
 
     # Check for an enterprise stack and attach its extension layer if present.
@@ -199,6 +278,21 @@ build_sam_params() {
     if [[ -n "$slim_layer_arn" ]] && [[ "$slim_layer_arn" != "None" ]]; then
         params="$params EnterpriseLayerArn=$slim_layer_arn"
         print_success "Found enterprise slim layer: $slim_layer_arn" >&2
+    elif ! stack_exists "$enterprise_stack" && main_stack_exists; then
+        # No enterprise stack under this prefix -- but the main stack may still
+        # have a layer attached (e.g. it was published by a stack deployed under a
+        # DIFFERENT prefix, which this lookup cannot see). Do not let that silently
+        # detach the layer: without EnterpriseLayerArn the template reverts it to
+        # "", HasEnterpriseLayer goes false, and every function loses the extension
+        # layer -- stranding LlmProvider/EmbeddingProvider on a provider name that
+        # nothing implements. Keep whatever is deployed.
+        local deployed_layer_arn
+        deployed_layer_arn=$(resolve_sticky_param "EnterpriseLayerArn")
+        if [[ -n "$deployed_layer_arn" ]]; then
+            params="$params EnterpriseLayerArn=$deployed_layer_arn"
+            print_warning "No '$enterprise_stack' stack; keeping the layer already on the stack:" >&2
+            echo "    $deployed_layer_arn" >&2
+        fi
     elif stack_exists "$enterprise_stack"; then
         # The enterprise stack is deployed but predates the slim layer. Fail
         # loudly rather than silently attaching a layer that cannot fit.
