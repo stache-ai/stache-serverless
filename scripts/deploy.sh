@@ -35,6 +35,19 @@ set -e
 #   STACHE_INGEST_JOBSTORE_PROVIDER Ingestion job store provider name (default: dynamodb)
 #   STACHE_INGEST_BLOB_PROVIDER Original-blob store provider name (default: s3)
 #   STACHE_ENABLE_ADMIN_PASSWORD_AUTH  "true"/"false", same as the flags above
+#   STACHE_ALLOW_PYPI_WITH_EXTENSION  Set to 1 to allow a PyPI layer build even
+#                               though an extension stack is deployed (normally
+#                               refused -- see below)
+#
+# AN EXTENSION STACK MEANS --from-source.
+#   This layer installs stache-ai, from PyPI unless --from-source says otherwise.
+#   An extension stack's layer ships providers built against the LOCAL stache-ai,
+#   which can import seams the published release does not have yet. If they do,
+#   nothing errors: the import fails, provider discovery skips the provider, and
+#   the functions come up healthy on the built-in providers with the extension
+#   silently not running. So when an extension stack exists this build refuses to
+#   use PyPI. Override with STACHE_ALLOW_PYPI_WITH_EXTENSION=1 once the published
+#   version genuinely matches.
 #
 # STACK PARAMETERS ARE STICKY.
 #   sam deploy resolves any parameter it is NOT given to the TEMPLATE DEFAULT, not
@@ -229,6 +242,11 @@ fi
 if [[ "$SKIP_BACKEND" == false ]]; then
     # Build Lambda layer
     if [[ "$SKIP_LAYER" == false ]]; then
+        # A PyPI build under a deployed extension stack is a silently broken
+        # deployment -- see require_source_build_with_extension. Refuse before
+        # anything is built or deployed.
+        require_source_build_with_extension "$FROM_SOURCE" || exit 1
+
         print_header "Building Lambda layer"
 
         rm -rf "$PROJECT_DIR/layer"

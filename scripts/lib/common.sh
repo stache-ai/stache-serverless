@@ -205,6 +205,66 @@ get_existing_domain_config() {
     fi
 }
 
+# Refuse a PyPI layer build underneath a deployed extension stack.
+#
+# This layer is what installs stache-ai, and by default it installs it from
+# PyPI. An extension stack ships its own layer of providers on top of this one,
+# and those providers are built against the LOCAL stache-ai -- they import seams
+# that the published release may not have yet. Install this layer from PyPI
+# under an extension layer built against a newer local stache-ai and the result
+# is a deployment that is broken but LOOKS FINE:
+#
+#   the extension's provider imports a seam the published stache-ai lacks
+#     -> ImportError
+#     -> provider discovery skips it (deliberately: a provider with an
+#        uninstalled optional dependency must not break the ones next to it)
+#     -> the provider is simply absent from the registry
+#     -> the functions come up healthy, on the built-in providers, and every
+#        extension the layer was carrying is silently not running
+#
+# That shipped once. Nothing errored; only an end-to-end test caught it. So:
+# when an extension stack exists, this build must come from source.
+#
+# STACHE_ALLOW_PYPI_WITH_EXTENSION=1 overrides, for the day the published
+# version genuinely matches the seams the extension packages were built against.
+#
+# Args: $1 = FROM_SOURCE (empty when building from PyPI)
+require_source_build_with_extension() {
+    local from_source="$1"
+
+    [[ -n "$from_source" ]] && return 0
+
+    if [[ "${STACHE_ALLOW_PYPI_WITH_EXTENSION:-}" == "1" ]]; then
+        print_warning "STACHE_ALLOW_PYPI_WITH_EXTENSION=1: building this layer from PyPI"
+        echo "  even though an extension stack is deployed. The published stache-ai must" >&2
+        echo "  actually provide every seam the extension layer's packages import, or the" >&2
+        echo "  extension's providers will fail to import and be silently skipped." >&2
+        return 0
+    fi
+
+    local extension_stack="${RESOURCE_PREFIX}-enterprise"
+    stack_exists "$extension_stack" || return 0
+
+    print_error "Refusing to build this layer from PyPI: an extension stack is deployed."
+    echo "  Stack '$extension_stack' exists, so the core functions run with its" >&2
+    echo "  extension layer attached. That layer's providers are built against the" >&2
+    echo "  LOCAL stache-ai and may import seams the PUBLISHED stache-ai does not have" >&2
+    echo "  yet." >&2
+    echo "" >&2
+    echo "  If they do, nothing errors. The import fails, provider discovery skips the" >&2
+    echo "  provider, it vanishes from the registry, and the functions come up healthy" >&2
+    echo "  on the built-in providers -- with every extension the layer was carrying" >&2
+    echo "  silently not running. This has happened. Only an e2e test found it." >&2
+    echo "" >&2
+    echo "  Build the layer from local source instead:" >&2
+    echo "      $0 --from-source" >&2
+    echo "" >&2
+    echo "  Once the published stache-ai genuinely matches the seams the extension" >&2
+    echo "  packages import, you can allow the PyPI build explicitly:" >&2
+    echo "      STACHE_ALLOW_PYPI_WITH_EXTENSION=1 $0" >&2
+    return 1
+}
+
 # Build SAM parameter string
 # Writes the parameter string to stdout; all human-facing output goes to stderr
 # because callers capture stdout via $(...).
