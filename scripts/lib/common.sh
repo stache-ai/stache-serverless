@@ -260,6 +260,8 @@ build_sam_params() {
     # (AppDomain/CertificateArn above are already made sticky by
     # get_existing_domain_config, which seeds DOMAIN/CERT_ARN from the stack.)
     local llm_provider embedding_provider embedding_model admin_password_auth
+    local vectordb_provider namespace_provider document_index_provider
+    local ingest_jobstore_provider ingest_blob_provider
 
     llm_provider=$(resolve_sticky_param "LlmProvider" "${STACHE_LLM_PROVIDER:-}")
     if [[ -n "$llm_provider" ]]; then
@@ -271,6 +273,39 @@ build_sam_params() {
     if [[ -n "$embedding_provider" ]]; then
         params="$params EmbeddingProvider=$embedding_provider"
         print_success "Embedding provider: $embedding_provider" >&2
+    fi
+
+    # The storage-side provider names. Same story as the two above: an extension
+    # layer may register its own implementations under different names, and those
+    # names have to survive a plain redeploy of this stack.
+    vectordb_provider=$(resolve_sticky_param "VectorDbProvider" "${STACHE_VECTORDB_PROVIDER:-}")
+    if [[ -n "$vectordb_provider" ]]; then
+        params="$params VectorDbProvider=$vectordb_provider"
+        print_success "Vector DB provider: $vectordb_provider" >&2
+    fi
+
+    namespace_provider=$(resolve_sticky_param "NamespaceProvider" "${STACHE_NAMESPACE_PROVIDER:-}")
+    if [[ -n "$namespace_provider" ]]; then
+        params="$params NamespaceProvider=$namespace_provider"
+        print_success "Namespace provider: $namespace_provider" >&2
+    fi
+
+    document_index_provider=$(resolve_sticky_param "DocumentIndexProvider" "${STACHE_DOCUMENT_INDEX_PROVIDER:-}")
+    if [[ -n "$document_index_provider" ]]; then
+        params="$params DocumentIndexProvider=$document_index_provider"
+        print_success "Document index provider: $document_index_provider" >&2
+    fi
+
+    ingest_jobstore_provider=$(resolve_sticky_param "IngestJobstoreProvider" "${STACHE_INGEST_JOBSTORE_PROVIDER:-}")
+    if [[ -n "$ingest_jobstore_provider" ]]; then
+        params="$params IngestJobstoreProvider=$ingest_jobstore_provider"
+        print_success "Ingest job store provider: $ingest_jobstore_provider" >&2
+    fi
+
+    ingest_blob_provider=$(resolve_sticky_param "IngestBlobProvider" "${STACHE_INGEST_BLOB_PROVIDER:-}")
+    if [[ -n "$ingest_blob_provider" ]]; then
+        params="$params IngestBlobProvider=$ingest_blob_provider"
+        print_success "Ingest blob provider: $ingest_blob_provider" >&2
     fi
 
     embedding_model=$(resolve_sticky_param "BedrockEmbeddingModel" "${STACHE_BEDROCK_EMBEDDING_MODEL:-}")

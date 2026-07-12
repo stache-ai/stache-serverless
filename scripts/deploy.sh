@@ -29,14 +29,24 @@ set -e
 #   STACHE_BEDROCK_EMBEDDING_MODEL  Same as --embedding-model
 #   STACHE_LLM_PROVIDER         LLM provider name to resolve at runtime (default: bedrock)
 #   STACHE_EMBEDDING_PROVIDER   Embedding provider name to resolve at runtime (default: bedrock)
+#   STACHE_VECTORDB_PROVIDER    Vector DB provider name (default: s3vectors)
+#   STACHE_NAMESPACE_PROVIDER   Namespace registry provider name (default: dynamodb)
+#   STACHE_DOCUMENT_INDEX_PROVIDER  Document index provider name (default: dynamodb)
+#   STACHE_INGEST_JOBSTORE_PROVIDER Ingestion job store provider name (default: dynamodb)
+#   STACHE_INGEST_BLOB_PROVIDER Original-blob store provider name (default: s3)
 #   STACHE_ENABLE_ADMIN_PASSWORD_AUTH  "true"/"false", same as the flags above
 #
 # STACK PARAMETERS ARE STICKY.
 #   sam deploy resolves any parameter it is NOT given to the TEMPLATE DEFAULT, not
 #   to the stack's current value, so omitting a flag on a redeploy would otherwise
-#   silently revert it. The four settings above (providers, embedding model, admin
-#   password auth) are therefore re-read from the deployed stack and re-sent when
-#   you do not pass them. Passing a flag / env var still wins.
+#   silently revert it. The settings above (all seven provider names, the embedding
+#   model, admin password auth) are therefore re-read from the deployed stack and
+#   re-sent when you do not pass them. Passing a flag / env var still wins.
+#
+#   This matters most for the provider names: an extension layer registers its own
+#   provider implementations under its own names, and CloudFormation rewrites the
+#   whole Lambda environment on every deploy -- so without stickiness a routine
+#   redeploy would quietly put every function back on the built-in providers.
 #
 # CHANGING THE EMBEDDING MODEL IS A RE-INDEX, NOT A CONFIG TWEAK.
 #   Embed v3 and Embed v4 produce vectors in different embedding spaces. Pointing

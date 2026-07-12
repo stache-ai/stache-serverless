@@ -44,6 +44,44 @@ Parameters:
       Defaults to the built-in "bedrock" provider. See LlmProvider for why this
       is parameterized.
     Default: "bedrock"
+  VectorDbProvider:
+    Type: String
+    Description: >-
+      Name of the vector database provider to resolve at runtime
+      (VECTORDB_PROVIDER). Defaults to "s3vectors", the provider whose S3 Vectors
+      bucket and indexes this template creates. See LlmProvider for why this is
+      parameterized.
+    Default: "s3vectors"
+  NamespaceProvider:
+    Type: String
+    Description: >-
+      Name of the namespace registry provider to resolve at runtime
+      (NAMESPACE_PROVIDER). Defaults to "dynamodb", backed by the NamespaceTable
+      this template creates. See LlmProvider for why this is parameterized.
+    Default: "dynamodb"
+  DocumentIndexProvider:
+    Type: String
+    Description: >-
+      Name of the document index provider to resolve at runtime
+      (DOCUMENT_INDEX_PROVIDER). Defaults to "dynamodb", backed by the
+      DocumentsTable this template creates. See LlmProvider for why this is
+      parameterized.
+    Default: "dynamodb"
+  IngestJobstoreProvider:
+    Type: String
+    Description: >-
+      Name of the ingestion job store provider to resolve at runtime
+      (INGEST_JOBSTORE_PROVIDER). Defaults to "dynamodb", backed by the
+      IngestJobsTable this template creates. See LlmProvider for why this is
+      parameterized.
+    Default: "dynamodb"
+  IngestBlobProvider:
+    Type: String
+    Description: >-
+      Name of the original-blob store provider to resolve at runtime
+      (INGEST_BLOB_PROVIDER). Defaults to "s3", backed by the OriginalsBucket
+      this template creates. See LlmProvider for why this is parameterized.
+    Default: "s3"
   AppDomain:
     Type: String
     Description: Custom domain for the application (optional)
@@ -103,16 +141,18 @@ Globals:
     Environment:
       Variables:
         # Provider Configuration
-        # LLM_PROVIDER / EMBEDDING_PROVIDER are parameterized so an extension
-        # layer can supply its own provider names. Do NOT hardcode them back to
-        # "bedrock": CloudFormation rewrites the entire Lambda environment on
-        # every deploy, so a hardcoded value silently reverts whatever the
-        # extension applied out-of-band.
+        # Every provider name below is parameterized so an extension layer can
+        # supply its own provider implementations. Do NOT hardcode them back to
+        # the built-in names: CloudFormation rewrites the entire Lambda
+        # environment on every deploy, so a hardcoded value silently reverts
+        # whatever the extension applied out-of-band.
         LLM_PROVIDER: !Ref LlmProvider
         EMBEDDING_PROVIDER: !Ref EmbeddingProvider
-        VECTORDB_PROVIDER: s3vectors
-        NAMESPACE_PROVIDER: dynamodb
-        DOCUMENT_INDEX_PROVIDER: dynamodb
+        VECTORDB_PROVIDER: !Ref VectorDbProvider
+        NAMESPACE_PROVIDER: !Ref NamespaceProvider
+        DOCUMENT_INDEX_PROVIDER: !Ref DocumentIndexProvider
+        INGEST_JOBSTORE_PROVIDER: !Ref IngestJobstoreProvider
+        INGEST_BLOB_PROVIDER: !Ref IngestBlobProvider
         RERANKER_PROVIDER: simple
 
         # AWS Provider Settings (AWS_REGION is automatically set by Lambda)
@@ -515,10 +555,12 @@ Resources:
         TargetArn: !GetAtt LambdaDLQ.Arn
       Environment:
         Variables:
-          # Ingestion Phase 2 - AWS async tier
+          # Ingestion Phase 2 - AWS async tier.
+          # INGEST_JOBSTORE_PROVIDER / INGEST_BLOB_PROVIDER come from Globals
+          # (parameterized) -- do NOT re-pin them here, a function-level value
+          # overrides the global one and would strand this function on the
+          # built-in providers.
           INGEST_QUEUE_PROVIDER: sqs
-          INGEST_JOBSTORE_PROVIDER: dynamodb
-          INGEST_BLOB_PROVIDER: s3
           INGEST_QUEUE_SQS_URL: !Ref IngestQueue
           INGEST_JOBSTORE_DYNAMODB_TABLE: !Ref IngestJobsTable
           INGEST_BLOB_S3_BUCKET: !Ref OriginalsBucket
@@ -656,6 +698,16 @@ Resources:
       MemorySize: 512
       Layers:
         - !Ref StacheLayer
+      Environment:
+        Variables:
+          # This worker runs with the CORE layer only (no EnterpriseLayerArn), so
+          # it can only resolve providers the core layer actually ships. Pin it to
+          # the built-ins rather than inherit the parameterized names from
+          # Globals: those may point at an implementation that exists only in an
+          # extension layer, which this function does not load.
+          VECTORDB_PROVIDER: s3vectors
+          NAMESPACE_PROVIDER: dynamodb
+          DOCUMENT_INDEX_PROVIDER: dynamodb
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref DocumentsTable
@@ -695,6 +747,13 @@ Resources:
       MemorySize: 256
       Layers:
         - !Ref StacheLayer
+      Environment:
+        Variables:
+          # Core layer only -- pinned to the built-in providers for the same
+          # reason as CleanupWorkerFunction above.
+          VECTORDB_PROVIDER: s3vectors
+          NAMESPACE_PROVIDER: dynamodb
+          DOCUMENT_INDEX_PROVIDER: dynamodb
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref DocumentsTable
@@ -874,9 +933,9 @@ Resources:
         - !If [HasEnterpriseLayer, !Ref EnterpriseLayerArn, !Ref "AWS::NoValue"]
       Environment:
         Variables:
+          # INGEST_JOBSTORE_PROVIDER / INGEST_BLOB_PROVIDER come from Globals
+          # (parameterized) -- see the note on ApiFunction.
           INGEST_QUEUE_PROVIDER: sqs
-          INGEST_JOBSTORE_PROVIDER: dynamodb
-          INGEST_BLOB_PROVIDER: s3
           INGEST_QUEUE_SQS_URL: !Ref IngestQueue
           INGEST_JOBSTORE_DYNAMODB_TABLE: !Ref IngestJobsTable
           INGEST_BLOB_S3_BUCKET: !Ref OriginalsBucket
@@ -962,6 +1021,9 @@ Resources:
         - !Ref StacheLayer
       Environment:
         Variables:
+          # Core layer only -- pinned to the built-in job store for the same
+          # reason as CleanupWorkerFunction: it cannot resolve a provider name
+          # that lives in an extension layer it does not load.
           INGEST_JOBSTORE_PROVIDER: dynamodb
           INGEST_JOBSTORE_DYNAMODB_TABLE: !Ref IngestJobsTable
       Policies:
