@@ -365,6 +365,8 @@ if [[ "$SKIP_FRONTEND" == false ]]; then
     export VITE_COGNITO_CLIENT_ID="$USER_POOL_CLIENT_ID"
     export VITE_COGNITO_DOMAIN="$COGNITO_DOMAIN"
     export VITE_API_URL="$API_URL"
+    # Empty on a core-only deployment; the frontend treats that as "no extension".
+    export VITE_ENTERPRISE_API_URL="${ENTERPRISE_API_URL:-}"
 
     npm ci --silent
     npm run build

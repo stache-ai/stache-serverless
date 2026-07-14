@@ -469,12 +469,39 @@ get_cognito_client_secret() {
         --output text 2>/dev/null || echo ""
 }
 
+# Base URL of the extension API, or "" when there is no extension.
+#
+# An extension stack (${RESOURCE_PREFIX}-enterprise, the same stack the layer
+# lookup in build_sam_params consults) serves its own routes from its OWN HTTP
+# API -- a different base URL from this stack's ApiUrl. Clients that call those
+# routes need that URL, so we publish it alongside API_URL.
+#
+# This is best-effort: no extension stack, or an extension stack that exposes no
+# such API, yields "" and the deploy carries on. A core-only deployment is the
+# normal case, not an error.
+get_extension_api_url() {
+    local extension_stack="${RESOURCE_PREFIX:-}-enterprise"
+    local url
+
+    # "TenantHttpApiUrl" is the extension stack's own output key, copied
+    # verbatim -- it is that stack's name for its output, not a concept this
+    # repo models. This is the only place it appears.
+    url=$(get_stack_output "$extension_stack" "TenantHttpApiUrl")
+
+    if [[ -z "$url" ]] || [[ "$url" == "None" ]]; then
+        echo ""
+        return 0
+    fi
+    echo "$url"
+}
+
 # Get all stack outputs needed for frontend and stache-tools
 get_frontend_config() {
     USER_POOL_ID=$(get_stack_output "$STACK_NAME" "UserPoolId")
     USER_POOL_CLIENT_ID=$(get_stack_output "$STACK_NAME" "UserPoolClientId")
     COGNITO_DOMAIN=$(get_stack_output "$STACK_NAME" "UserPoolDomain")
     API_URL=$(get_stack_output "$STACK_NAME" "ApiUrl")
+    ENTERPRISE_API_URL=$(get_extension_api_url)
     FRONTEND_BUCKET=$(get_stack_output "$STACK_NAME" "FrontendBucketName")
     CLOUDFRONT_ID=$(get_stack_output "$STACK_NAME" "CloudFrontDistributionId")
     FRONTEND_URL=$(get_stack_output "$STACK_NAME" "FrontendUrl")
@@ -513,12 +540,14 @@ deploy_frontend() {
         --arg client_id "$USER_POOL_CLIENT_ID" \
         --arg domain "$COGNITO_DOMAIN" \
         --arg api_url "$API_URL" \
+        --arg enterprise_api_url "${ENTERPRISE_API_URL:-}" \
         '{
           AUTH_PROVIDER: $auth,
           COGNITO_USER_POOL_ID: $pool_id,
           COGNITO_CLIENT_ID: $client_id,
           COGNITO_DOMAIN: $domain,
-          API_URL: $api_url
+          API_URL: $api_url,
+          ENTERPRISE_API_URL: $enterprise_api_url
         }' > "$frontend_dir/config.json"
     print_success "Generated runtime config.json"
 
