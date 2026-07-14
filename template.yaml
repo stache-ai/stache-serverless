@@ -24,6 +24,18 @@ Parameters:
       Embed v4 (cohere.embed-v4:0) supports Matryoshka output dimensions; keep
       EmbeddingDimension at 1024 to match the dimension the S3 Vectors indexes
       are created with.
+
+      PREFER THE CROSS-REGION INFERENCE PROFILE -- the "us." prefix. It is the
+      SAME model and the SAME weights, so the vectors are identical and no
+      re-index is needed, but the request quota is twenty times higher:
+
+          cohere.embed-v4:0        (on-demand)     100 requests/min
+          us.cohere.embed-v4:0     (cross-region) 2000 requests/min
+
+      A query embeds ONE text and cannot be batched, so requests/min is the hard
+      ceiling on concurrent users -- 100 RPM caps the whole deployment at ~100
+      queries a minute across every tenant. The LLM models here already use the
+      "us." prefix; the embedding model is the one that was left behind.
     Default: "cohere.embed-english-v3"
   LlmProvider:
     Type: String
