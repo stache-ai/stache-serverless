@@ -37,6 +37,24 @@ Parameters:
       queries a minute across every tenant. The LLM models here already use the
       "us." prefix; the embedding model is the one that was left behind.
     Default: "cohere.embed-english-v3"
+  AiEnrichmentModel:
+    Type: String
+    Description: >-
+      Bedrock model id for AI enrichment only (AI_ENRICHMENT_MODEL). Empty
+      (the default) means unset: enrichment runs on BEDROCK_LLM_MODEL exactly
+      as today. Set to e.g. us.amazon.nova-lite-v1:0 to route enrichment to a
+      cheaper/faster model without touching query answering.
+    Default: ""
+  IngestMaxConcurrency:
+    Type: Number
+    Description: >-
+      SQS MaximumConcurrency for the ingest worker. With BatchSize 1 and one
+      enrichment LLM call per ingest this caps concurrent Bedrock enrichment
+      calls, keeping bulk ingest under the model RPM quota while leaving
+      headroom for queries. Minimum 2 is an SQS ScalingConfig requirement.
+    Default: 5
+    MinValue: 2
+    MaxValue: 1000
   LlmProvider:
     Type: String
     Description: >-
@@ -169,7 +187,9 @@ Globals:
 
         # AWS Provider Settings (AWS_REGION is automatically set by Lambda)
         BEDROCK_LLM_MODEL: us.amazon.nova-pro-v1:0
-        BEDROCK_ENRICHMENT_MODEL: us.amazon.nova-lite-v1:0
+        # Empty = unset: enrichment falls back to BEDROCK_LLM_MODEL. Applied
+        # via Globals so the API function and the ingest worker stay in step.
+        AI_ENRICHMENT_MODEL: !Ref AiEnrichmentModel
         BEDROCK_EMBEDDING_MODEL: !Ref BedrockEmbeddingModel
         S3VECTORS_BUCKET: !Sub '${ResourcePrefix}-vectors-${AWS::AccountId}'
         S3VECTORS_INDEX: !Sub '${ResourcePrefix}-vectors'
@@ -1017,6 +1037,10 @@ Resources:
           Properties:
             Queue: !GetAtt IngestQueue.Arn
             BatchSize: 1
+            # Backpressure: with BatchSize 1 this caps concurrent enrichment
+            # LLM calls, keeping bulk ingest under the Bedrock RPM quota.
+            ScalingConfig:
+              MaximumConcurrency: !Ref IngestMaxConcurrency
             FunctionResponseTypes:
               - ReportBatchItemFailures
 

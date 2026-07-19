@@ -556,7 +556,8 @@ deploy_frontend() {
         --delete \
         --cache-control "max-age=31536000,public" \
         --exclude "index.html" \
-        --exclude "*.json"
+        --exclude "*.json" \
+        --exclude "graph/*"
 
     # Upload index.html with no-cache
     aws s3 cp "$frontend_dir/index.html" "s3://$FRONTEND_BUCKET/index.html" \
