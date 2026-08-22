@@ -8,6 +8,17 @@ set -e
 #   --prefix <prefix>           Resource prefix (default: stache, allows multiple deployments)
 #   --domain <domain>           Custom domain - certificate looked up by domain name
 #   --certificate-arn <arn>     ACM certificate ARN (optional, auto-detected from domain)
+#   --cognito-domain <domain>   Custom Cognito hosted-UI domain (e.g. auth.example.com),
+#                               created ALONGSIDE the prefix domain (both coexist). The JWT issuer
+#                               is unchanged, so the API/authorizers are unaffected. Cert is
+#                               auto-looked-up by name unless --cognito-certificate-arn is given.
+#                               Provisions CloudFront (~15-20 min); the deploy prints the CNAME.
+#   --cognito-certificate-arn <arn>  ACM cert (MUST be us-east-1) for --cognito-domain (optional,
+#                               auto-detected from the domain name).
+#   --use-cognito-domain        Build the FRONTEND against the custom Cognito domain instead of the
+#                               prefix domain. Decoupled from creation: only pass this AFTER the
+#                               custom domain is live (CloudFront provisioned + CNAME resolving),
+#                               or hosted-UI logins will break.
 #   --skip-frontend             Skip frontend build and deployment
 #   --skip-backend              Skip SAM build and deploy (frontend only)
 #   --skip-layer                Skip Lambda layer build (use existing)
@@ -84,6 +95,9 @@ SKIP_LAYER=false
 SAM_ONLY=false
 DOMAIN=""
 CERT_ARN=""
+COGNITO_CUSTOM_DOMAIN=""
+COGNITO_CERT_ARN=""
+USE_COGNITO_DOMAIN=false
 FROM_SOURCE=""
 LOCAL_ENV_FILE=""
 
@@ -118,6 +132,18 @@ while [[ $# -gt 0 ]]; do
         --certificate-arn)
             CERT_ARN="$2"
             shift 2
+            ;;
+        --cognito-domain)
+            COGNITO_CUSTOM_DOMAIN="$2"
+            shift 2
+            ;;
+        --cognito-certificate-arn)
+            COGNITO_CERT_ARN="$2"
+            shift 2
+            ;;
+        --use-cognito-domain)
+            USE_COGNITO_DOMAIN=true
+            shift
             ;;
         --skip-frontend)
             SKIP_FRONTEND=true
@@ -226,6 +252,31 @@ if [[ -n "$DOMAIN" ]]; then
     fi
 fi
 
+# Handle custom Cognito hosted-UI domain (independent of --domain). The cert for a
+# Cognito custom domain is CloudFront-backed and MUST live in us-east-1 regardless
+# of the pool's region; we look it up in $AWS_REGION (us-east-1 for this stack).
+if [[ -n "$COGNITO_CUSTOM_DOMAIN" ]]; then
+    if [[ -z "$COGNITO_CERT_ARN" ]]; then
+        COGNITO_CERT_ARN=$(aws acm list-certificates --region "$AWS_REGION" \
+            --query "CertificateSummaryList[?DomainName=='$COGNITO_CUSTOM_DOMAIN'].CertificateArn | [0]" \
+            --output text 2>/dev/null || echo "")
+        if [[ -z "$COGNITO_CERT_ARN" ]] || [[ "$COGNITO_CERT_ARN" == "None" ]]; then
+            print_error "No ACM certificate found for Cognito domain: $COGNITO_CUSTOM_DOMAIN"
+            echo "Request one first (us-east-1, DNS-validated):"
+            echo "  aws acm request-certificate --region us-east-1 \\"
+            echo "    --domain-name $COGNITO_CUSTOM_DOMAIN --validation-method DNS"
+            exit 1
+        fi
+    fi
+    cognito_cert_status=$(get_certificate_status "$COGNITO_CERT_ARN")
+    if [[ "$cognito_cert_status" != "ISSUED" ]]; then
+        print_error "Cognito domain certificate is not validated (status: $cognito_cert_status)"
+        echo "It must be ISSUED before CloudFormation can attach the custom domain."
+        exit 1
+    fi
+    print_success "Using certificate for Cognito domain: $COGNITO_CUSTOM_DOMAIN"
+fi
+
 # Check for stache repo if building from source
 if [[ -n "$FROM_SOURCE" ]]; then
     if [[ ! -d "$FROM_SOURCE/packages" ]]; then
@@ -309,6 +360,7 @@ if [[ "$SKIP_BACKEND" == false ]]; then
     if stack_exists "$STACK_NAME"; then
         print_warning "Updating existing stack"
         get_existing_domain_config
+        get_existing_cognito_domain_config
     fi
 
     # Deploy

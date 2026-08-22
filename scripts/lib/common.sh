@@ -205,6 +205,25 @@ get_existing_domain_config() {
     fi
 }
 
+# Get existing custom Cognito domain config from the main stack. Mirrors
+# get_existing_domain_config so a plain redeploy re-sends CognitoCustomDomain/
+# CognitoCertificateArn rather than reverting them to the template default ""
+# (which would DELETE the custom UserPoolDomain). The flag still wins if set.
+get_existing_cognito_domain_config() {
+    if stack_exists "$STACK_NAME"; then
+        local existing_domain existing_cert
+        existing_domain=$(get_stack_parameter "$STACK_NAME" "CognitoCustomDomain")
+        existing_cert=$(get_stack_parameter "$STACK_NAME" "CognitoCertificateArn")
+
+        if [[ -n "$existing_domain" ]] && [[ "$existing_domain" != "None" ]]; then
+            COGNITO_CUSTOM_DOMAIN="${COGNITO_CUSTOM_DOMAIN:-$existing_domain}"
+        fi
+        if [[ -n "$existing_cert" ]] && [[ "$existing_cert" != "None" ]]; then
+            COGNITO_CERT_ARN="${COGNITO_CERT_ARN:-$existing_cert}"
+        fi
+    fi
+}
+
 # Refuse a PyPI layer build underneath a deployed extension stack.
 #
 # This layer is what installs stache-ai, and by default it installs it from
@@ -307,6 +326,14 @@ build_sam_params() {
     fi
     if [[ -n "${CERT_ARN:-}" ]] && [[ "$CERT_ARN" != "None" ]]; then
         params="$params CertificateArn=$CERT_ARN"
+    fi
+    # Custom Cognito domain (sticky via get_existing_cognito_domain_config, same
+    # as AppDomain/CertificateArn above).
+    if [[ -n "${COGNITO_CUSTOM_DOMAIN:-}" ]] && [[ "$COGNITO_CUSTOM_DOMAIN" != "None" ]]; then
+        params="$params CognitoCustomDomain=$COGNITO_CUSTOM_DOMAIN"
+    fi
+    if [[ -n "${COGNITO_CERT_ARN:-}" ]] && [[ "$COGNITO_CERT_ARN" != "None" ]]; then
+        params="$params CognitoCertificateArn=$COGNITO_CERT_ARN"
     fi
 
     # Provider names and the embedding model are parameterized rather than
@@ -500,6 +527,23 @@ get_frontend_config() {
     USER_POOL_ID=$(get_stack_output "$STACK_NAME" "UserPoolId")
     USER_POOL_CLIENT_ID=$(get_stack_output "$STACK_NAME" "UserPoolClientId")
     COGNITO_DOMAIN=$(get_stack_output "$STACK_NAME" "UserPoolDomain")
+    COGNITO_CUSTOM_DOMAIN_NAME=$(get_stack_output "$STACK_NAME" "CognitoCustomDomainName")
+    COGNITO_CUSTOM_DOMAIN_TARGET=$(get_stack_output "$STACK_NAME" "CognitoCustomDomainTarget")
+
+    # Decoupled cutover: the frontend keeps using the prefix hosted-UI domain until
+    # --use-cognito-domain is passed, at which point it builds against the custom
+    # Cognito domain. That domain must already be live (CloudFront provisioned and
+    # its CNAME resolving) or hosted-UI logins break. Note COGNITO_CUSTOM_DOMAIN_NAME
+    # is the bare FQDN; the prefix COGNITO_DOMAIN output is a full *.amazoncognito.com
+    # host -- the frontend auth client treats both as the hosted-UI host.
+    if [[ "${USE_COGNITO_DOMAIN:-false}" == "true" ]]; then
+        if [[ -n "$COGNITO_CUSTOM_DOMAIN_NAME" ]] && [[ "$COGNITO_CUSTOM_DOMAIN_NAME" != "None" ]]; then
+            COGNITO_DOMAIN="$COGNITO_CUSTOM_DOMAIN_NAME"
+            print_success "Frontend will use custom Cognito domain: $COGNITO_DOMAIN" >&2
+        else
+            print_warning "--use-cognito-domain set but stack has no custom Cognito domain; using prefix domain" >&2
+        fi
+    fi
     API_URL=$(get_stack_output "$STACK_NAME" "ApiUrl")
     ENTERPRISE_API_URL=$(get_extension_api_url)
     FRONTEND_BUCKET=$(get_stack_output "$STACK_NAME" "FrontendBucketName")
@@ -684,6 +728,22 @@ print_deploy_summary() {
         echo "    Type:  CNAME"
         echo "    Name:  $DOMAIN"
         echo "    Value: $CLOUDFRONT_DOMAIN"
+        echo ""
+    fi
+
+    # Custom Cognito hosted-UI domain CNAME (independent of the app domain above).
+    if [[ -n "${COGNITO_CUSTOM_DOMAIN_NAME:-}" ]] && [[ "$COGNITO_CUSTOM_DOMAIN_NAME" != "None" ]] \
+       && [[ -n "${COGNITO_CUSTOM_DOMAIN_TARGET:-}" ]] && [[ "$COGNITO_CUSTOM_DOMAIN_TARGET" != "None" ]]; then
+        echo -e "${YELLOW}Cognito Custom Domain Setup:${NC}"
+        echo "  Add this CNAME record (DNS-only, NOT proxied):"
+        echo ""
+        echo "    Type:  CNAME"
+        echo "    Name:  $COGNITO_CUSTOM_DOMAIN_NAME"
+        echo "    Value: $COGNITO_CUSTOM_DOMAIN_TARGET"
+        echo ""
+        echo "  The prefix hosted-UI domain still works. The frontend switches to the"
+        echo "  custom domain only when you redeploy it with --use-cognito-domain"
+        echo "  (do that after this CNAME resolves)."
         echo ""
     fi
 

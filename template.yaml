@@ -120,6 +120,24 @@ Parameters:
     Type: String
     Description: ACM certificate ARN for custom domain (required if AppDomain is set)
     Default: ""
+  CognitoCustomDomain:
+    Type: String
+    Description: >-
+      Custom domain for the Cognito hosted UI (e.g. auth.example.com),
+      independent of AppDomain. Optional. When set, a custom UserPoolDomain is
+      created ALONGSIDE the prefix domain (both coexist) and CognitoCertificateArn
+      is required. The JWT issuer is unaffected -- this only changes the hosted-UI
+      OAuth endpoints. The parent apex must already resolve (A record) or Cognito
+      refuses to attach the domain. Which auth domain the frontend actually uses is
+      a separate deploy-time choice (deploy.sh --use-cognito-domain).
+    Default: ""
+  CognitoCertificateArn:
+    Type: String
+    Description: >-
+      ACM certificate ARN (MUST be in us-east-1 -- the Cognito custom domain is
+      CloudFront-backed regardless of pool region) for CognitoCustomDomain.
+      Required if CognitoCustomDomain is set.
+    Default: ""
   EnterpriseLayerArn:
     Type: String
     Description: >-
@@ -158,6 +176,7 @@ Parameters:
     Default: "false"
 Conditions:
   UseCustomDomain: !Not [!Equals [!Ref AppDomain, ""]]
+  UseCognitoCustomDomain: !Not [!Equals [!Ref CognitoCustomDomain, ""]]
   HasEnterpriseLayer: !Not [!Equals [!Ref EnterpriseLayerArn, ""]]
   UseAdminPasswordAuth: !Equals [!Ref EnableAdminPasswordAuth, "true"]
 
@@ -537,6 +556,22 @@ Resources:
     Properties:
       Domain: !Sub '${AWS::StackName}-${AWS::AccountId}'
       UserPoolId: !Ref UserPool
+
+  # Optional custom Cognito hosted-UI domain, created ALONGSIDE the prefix domain
+  # above (a user pool holds both a prefix and a custom domain at once). Only the
+  # hosted-UI OAuth endpoints move to this name; the JWT issuer is unchanged, so
+  # the API/authorizers are unaffected. CloudFront-backed (~15-20 min to provision);
+  # its target is exported as CognitoCustomDomainTarget for the DNS CNAME. Requires
+  # CognitoCertificateArn (us-east-1) ISSUED at deploy time and the parent apex to
+  # already resolve.
+  UserPoolCustomDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Condition: UseCognitoCustomDomain
+    Properties:
+      Domain: !Ref CognitoCustomDomain
+      UserPoolId: !Ref UserPool
+      CustomDomainConfig:
+        CertificateArn: !Ref CognitoCertificateArn
 
   # Resource Server for machine-to-machine OAuth scopes
   # This defines custom scopes that can be used with client_credentials flow
@@ -1225,6 +1260,19 @@ Outputs:
     Value: !Sub '${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
     Export:
       Name: !Sub '${AWS::StackName}-UserPoolDomain'
+
+  CognitoCustomDomainName:
+    Description: Custom Cognito hosted-UI domain (empty if not configured)
+    Value: !If [UseCognitoCustomDomain, !Ref CognitoCustomDomain, '']
+
+  CognitoCustomDomainTarget:
+    Description: >-
+      CloudFront target for the custom Cognito domain's DNS CNAME (empty if not
+      configured). Point CognitoCustomDomainName at this with a DNS-only CNAME.
+    Value: !If
+      - UseCognitoCustomDomain
+      - !GetAtt UserPoolCustomDomain.CloudFrontDistribution
+      - ''
 
   # AgentCore outputs
   AgentCoreFunctionArn:
