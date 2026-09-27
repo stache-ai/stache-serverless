@@ -410,6 +410,22 @@ build_sam_params() {
         print_success "Admin password auth flow: $admin_password_auth" >&2
     fi
 
+    # Frontend hosting mode and the optional extra browser origin. Sticky: a
+    # redeploy that omits --frontend-hosting must NOT revert an external stack to
+    # "cloudfront" (which would recreate the bucket + distribution), nor drop an
+    # extra origin that Cognito callbacks and CORS depend on.
+    local frontend_hosting additional_origin
+    frontend_hosting=$(resolve_sticky_param "FrontendHosting" "${STACHE_FRONTEND_HOSTING:-}")
+    if [[ -n "$frontend_hosting" ]]; then
+        params="$params FrontendHosting=$frontend_hosting"
+        print_success "Frontend hosting: $frontend_hosting" >&2
+    fi
+    additional_origin=$(resolve_sticky_param "AdditionalFrontendOrigin" "${STACHE_ADDITIONAL_FRONTEND_ORIGIN:-}")
+    if [[ -n "$additional_origin" ]]; then
+        params="$params AdditionalFrontendOrigin=$additional_origin"
+        print_success "Additional frontend origin: $additional_origin" >&2
+    fi
+
     # Check for an enterprise stack and attach its extension layer if present.
     #
     # We consume EnterpriseSlimLayerArn -- the layer deduplicated against the
@@ -549,17 +565,19 @@ get_frontend_config() {
     FRONTEND_BUCKET=$(get_stack_output "$STACK_NAME" "FrontendBucketName")
     CLOUDFRONT_ID=$(get_stack_output "$STACK_NAME" "CloudFrontDistributionId")
     FRONTEND_URL=$(get_stack_output "$STACK_NAME" "FrontendUrl")
+    # FrontendHosting=external stacks have no bucket/distribution outputs.
+    [[ "$FRONTEND_BUCKET" == "None" ]] && FRONTEND_BUCKET=""
+    [[ "$CLOUDFRONT_ID" == "None" ]] && CLOUDFRONT_ID=""
+    [[ "$ENTERPRISE_API_URL" == "None" ]] && ENTERPRISE_API_URL=""
 
     # stache-tools outputs
     STACHE_TOOLS_CLIENT_ID=$(get_stack_output "$STACK_NAME" "StacheToolsClientId")
     STACHE_TOOLS_TOKEN_URL=$(get_stack_output "$STACK_NAME" "StacheToolsTokenUrl")
     STACHE_TOOLS_SCOPES=$(get_stack_output "$STACK_NAME" "StacheToolsScopes")
     API_FUNCTION_NAME=$(get_stack_output "$STACK_NAME" "ApiFunctionName")
-
-    # Get client secret from Cognito (not available via CloudFormation)
-    if [[ -n "$USER_POOL_ID" ]] && [[ -n "$STACHE_TOOLS_CLIENT_ID" ]]; then
-        STACHE_TOOLS_CLIENT_SECRET=$(get_cognito_client_secret "$USER_POOL_ID" "$STACHE_TOOLS_CLIENT_ID")
-    fi
+    # The stache-tools client secret is deliberately NOT fetched here: it is only
+    # needed by generate_local_env (which writes it to a local file), and a
+    # routine deploy must never echo it to the terminal or CI logs.
 
     # Get CloudFront domain name for custom domain CNAME setup
     if [[ -n "$CLOUDFRONT_ID" ]]; then
@@ -626,6 +644,70 @@ deploy_frontend() {
     print_success "CloudFront cache invalidated"
 }
 
+# Switching cloudfront -> external deletes FrontendBucket; CloudFormation cannot
+# delete a non-empty bucket, so empty it -- but only with explicit consent, and
+# only once DNS already points at the external host (nobody reads CloudFront).
+# Returns 0 when there is nothing to tear down (new stack, already external).
+confirm_frontend_teardown() {
+    main_stack_exists || return 0
+    local current bucket
+    current=$(get_stack_parameter "$STACK_NAME" "FrontendHosting")
+    [[ -z "$current" || "$current" == "None" ]] && current="cloudfront"
+    [[ "$current" == "cloudfront" ]] || return 0
+    if [[ "${CONFIRM_FRONTEND_TEARDOWN:-false}" != "true" ]]; then
+        print_error "Switching '$STACK_NAME' to external hosting DELETES its frontend bucket and CloudFront distribution."
+        echo "  Point your app domain at the external host first and verify it, then re-run with"
+        echo "  --confirm-frontend-teardown."
+        return 1
+    fi
+    bucket=$(get_stack_output "$STACK_NAME" "FrontendBucketName")
+    if [[ -n "$bucket" && "$bucket" != "None" ]]; then
+        print_warning "Emptying s3://$bucket so CloudFormation can delete it"
+        aws s3 rm "s3://$bucket" --recursive --region "$AWS_REGION" --only-show-errors || return 1
+    fi
+}
+
+# Public client config an external static host (e.g. Cloudflare Pages) needs to
+# build and serve the frontend. No secrets: everything here ships in the browser
+# bundle anyway. Honors --use-cognito-domain via get_frontend_config's
+# COGNITO_DOMAIN. Call get_frontend_config first.
+# Args: $1 = optional output file (default: print to stdout)
+print_frontend_env() {
+    local out="${1:-}"
+    local body
+    body=$(cat <<EOF
+# Stache frontend env ($STACK_NAME, $AWS_REGION) -- public client config, no secrets.
+# Registered app origin(s) (Cognito callbacks + API CORS): $(get_stack_output "$STACK_NAME" "FrontendOrigins")
+#
+# Build-time variables for the Vite frontend (set these as build env vars):
+VITE_AUTH_PROVIDER=cognito
+VITE_COGNITO_USER_POOL_ID=$USER_POOL_ID
+VITE_COGNITO_CLIENT_ID=$USER_POOL_CLIENT_ID
+VITE_COGNITO_DOMAIN=$COGNITO_DOMAIN
+VITE_API_URL=$API_URL
+VITE_ENTERPRISE_API_URL=${ENTERPRISE_API_URL:-}
+#
+# Runtime /config.json keys (served at the site root; same values):
+COGNITO_USER_POOL_ID=$USER_POOL_ID
+COGNITO_CLIENT_ID=$USER_POOL_CLIENT_ID
+COGNITO_DOMAIN=$COGNITO_DOMAIN
+COGNITO_REGION=$AWS_REGION
+API_URL=$API_URL
+ENTERPRISE_API_URL=${ENTERPRISE_API_URL:-}
+#
+# Do NOT set a Cognito redirect URI: the app uses its serving origin, which must
+# be one of the registered origins above.
+EOF
+)
+    if [[ -n "$out" ]]; then
+        printf '%s\n' "$body" > "$out"
+        print_success "Wrote frontend env to $out"
+    else
+        print_header "External frontend env"
+        printf '%s\n' "$body"
+    fi
+}
+
 # Generate .env file for local development
 generate_local_env() {
     local output_file="$1"
@@ -634,6 +716,13 @@ generate_local_env() {
     local ingest_queue_url=$(get_stack_output "$STACK_NAME" "IngestQueueUrl")
     local originals_bucket=$(get_stack_output "$STACK_NAME" "OriginalsBucket")
     local ingest_jobs_table=$(get_stack_output "$STACK_NAME" "IngestJobsTable")
+
+    # Client secret (not available via CloudFormation). Written to the local
+    # .env file only; never printed.
+    STACHE_TOOLS_CLIENT_SECRET=""
+    if [[ -n "$USER_POOL_ID" ]] && [[ -n "$STACHE_TOOLS_CLIENT_ID" ]]; then
+        STACHE_TOOLS_CLIENT_SECRET=$(get_cognito_client_secret "$USER_POOL_ID" "$STACHE_TOOLS_CLIENT_ID")
+    fi
 
     cat > "$output_file" << EOF
 # Stache Local Development Environment
@@ -752,11 +841,15 @@ print_deploy_summary() {
     echo "  Stack Name:     $STACK_NAME"
     echo "  Region:         $AWS_REGION"
     echo "  API Gateway:    $API_URL"
-    echo "  CloudFront ID:  $CLOUDFRONT_ID"
-    if [[ -n "${CLOUDFRONT_DOMAIN:-}" ]]; then
-        echo "  CloudFront:     $CLOUDFRONT_DOMAIN"
+    if [[ -n "${CLOUDFRONT_ID:-}" ]]; then
+        echo "  CloudFront ID:  $CLOUDFRONT_ID"
+        if [[ -n "${CLOUDFRONT_DOMAIN:-}" ]]; then
+            echo "  CloudFront:     $CLOUDFRONT_DOMAIN"
+        fi
+        echo "  S3 Bucket:      $FRONTEND_BUCKET"
+    elif [[ "${DEPLOYED_HOSTING:-}" == "external" ]]; then
+        echo "  Frontend:       external (https://$DOMAIN) -- point DNS at your static host"
     fi
-    echo "  S3 Bucket:      $FRONTEND_BUCKET"
     echo "  User Pool ID:   $USER_POOL_ID"
 
     # stache-tools configuration
@@ -785,14 +878,16 @@ print_deploy_summary() {
         echo '    }'
         echo ""
 
-        if [[ -n "${STACHE_TOOLS_CLIENT_ID:-}" ]] && [[ -n "${STACHE_TOOLS_CLIENT_SECRET:-}" ]]; then
+        if [[ -n "${STACHE_TOOLS_CLIENT_ID:-}" ]] && [[ "$STACHE_TOOLS_CLIENT_ID" != "None" ]]; then
             echo -e "${YELLOW}Option 2: HTTP Transport (OAuth)${NC}"
             echo "  Uses API Gateway with OAuth authentication."
             echo ""
             echo "  Environment variables:"
             echo "    export STACHE_API_URL=$API_URL"
             echo "    export STACHE_COGNITO_CLIENT_ID=$STACHE_TOOLS_CLIENT_ID"
-            echo "    export STACHE_COGNITO_CLIENT_SECRET=$STACHE_TOOLS_CLIENT_SECRET"
+            echo "    export STACHE_COGNITO_CLIENT_SECRET=\"\$(aws cognito-idp describe-user-pool-client \\"
+            echo "        --user-pool-id $USER_POOL_ID --client-id $STACHE_TOOLS_CLIENT_ID \\"
+            echo "        --region $AWS_REGION --query UserPoolClient.ClientSecret --output text)\""
             echo "    export STACHE_COGNITO_TOKEN_URL=$STACHE_TOOLS_TOKEN_URL"
             echo "    export STACHE_COGNITO_SCOPE=\"$STACHE_TOOLS_SCOPES\""
             echo ""

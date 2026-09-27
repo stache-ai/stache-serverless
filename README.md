@@ -195,6 +195,42 @@ Add the CNAME record shown in the output to validate the certificate. Wait for v
 
 After deployment, add a CNAME record pointing your domain to the CloudFront distribution shown in the output.
 
+## Frontend Hosting Options
+
+The `FrontendHosting` stack parameter (`--frontend-hosting`) picks where the web app is served from:
+
+| Mode | Use case | What the stack creates |
+|------|----------|------------------------|
+| `cloudfront` (default) | Self-hosting | S3 bucket + CloudFront distribution; `deploy.sh` builds and uploads the frontend |
+| `external` | Frontend on a separate static host (e.g. Cloudflare Pages) | No bucket or CloudFront. Cognito callbacks and API CORS use `https://<--domain>` |
+
+Existing stacks are unaffected: the default is `cloudfront`, and it produces the same resources as before.
+
+```bash
+# External hosting: the app lives at https://app.example.com on your static host
+./scripts/deploy.sh --frontend-hosting external --domain app.example.com
+
+# Optionally trust one extra origin (e.g. a preview host) for sign-in and CORS
+./scripts/deploy.sh --additional-frontend-origin https://my-app.pages.dev   # "none" clears it
+
+# Print the build env the static host needs (read-only; honors --use-cognito-domain)
+./scripts/deploy.sh --frontend-env              # or: --frontend-env frontend.env
+```
+
+In `external` mode `deploy.sh` skips the frontend build/upload and prints the values to set on the
+static host: `VITE_AUTH_PROVIDER`, `VITE_COGNITO_USER_POOL_ID`, `VITE_COGNITO_CLIENT_ID`,
+`VITE_COGNITO_DOMAIN`, `VITE_API_URL` (plus the matching runtime `/config.json` keys and
+`ENTERPRISE_API_URL` when an extension stack is deployed). None of these are secrets. Build the
+frontend from `stache/frontend` with those variables. Do not set a Cognito redirect URI: the app uses
+its serving origin, which must be `https://<--domain>` or the additional origin.
+
+Both flags are sticky. Once set, later deploys keep them unless you pass them again.
+
+**Switching an existing stack from `cloudfront` to `external` deletes its frontend bucket and CloudFront
+distribution.** Point DNS at the new host and verify it first. Then re-run with
+`--confirm-frontend-teardown`, which empties the bucket so CloudFormation can delete it. Preview the
+change set before doing this on a stack you care about.
+
 ## User Management
 
 ### Create a User
@@ -268,7 +304,9 @@ Uses API Gateway with Cognito OAuth. The deploy script outputs the credentials:
 # Set environment variables (shown in deploy.sh output)
 export STACHE_API_URL=https://xxx.execute-api.us-east-1.amazonaws.com/Prod/
 export STACHE_COGNITO_CLIENT_ID=abc123...
-export STACHE_COGNITO_CLIENT_SECRET=xyz789...
+export STACHE_COGNITO_CLIENT_SECRET="$(aws cognito-idp describe-user-pool-client \
+    --user-pool-id <UserPoolId> --client-id <StacheToolsClientId> \
+    --query UserPoolClient.ClientSecret --output text)"   # never printed by deploy.sh
 export STACHE_COGNITO_TOKEN_URL=https://xxx.auth.us-east-1.amazoncognito.com/oauth2/token
 export STACHE_COGNITO_SCOPE="stache-serverless-api/read stache-serverless-api/write"
 

@@ -19,6 +19,18 @@ set -e
 #                               prefix domain. Decoupled from creation: only pass this AFTER the
 #                               custom domain is live (CloudFront provisioned + CNAME resolving),
 #                               or hosted-UI logins will break.
+#   --frontend-hosting <mode>   cloudfront (default) | external. external = no S3 bucket/CloudFront;
+#                               the app is hosted elsewhere (e.g. Cloudflare Pages) at
+#                               https://<--domain> (required). The deploy prints the env vars the
+#                               external host needs instead of uploading the frontend. Sticky.
+#   --additional-frontend-origin <https://host>  Extra origin for Cognito callbacks + API CORS
+#                               (e.g. a preview host like https://my-app.pages.dev). "none"
+#                               clears it. Sticky.
+#   --confirm-frontend-teardown Required to switch an existing stack cloudfront -> external. Empties
+#                               the frontend bucket so CloudFormation can delete it, and the
+#                               CloudFront distribution is deleted. Repoint DNS FIRST.
+#   --frontend-env [file]       Print (or write to file) the public env an external frontend host
+#                               needs (honors --use-cognito-domain); no deploy.
 #   --skip-frontend             Skip frontend build and deployment
 #   --skip-backend              Skip SAM build and deploy (frontend only)
 #   --skip-layer                Skip Lambda layer build (use existing)
@@ -46,6 +58,8 @@ set -e
 #   STACHE_INGEST_JOBSTORE_PROVIDER Ingestion job store provider name (default: dynamodb)
 #   STACHE_INGEST_BLOB_PROVIDER Original-blob store provider name (default: s3)
 #   STACHE_ENABLE_ADMIN_PASSWORD_AUTH  "true"/"false", same as the flags above
+#   STACHE_FRONTEND_HOSTING     Same as --frontend-hosting
+#   STACHE_ADDITIONAL_FRONTEND_ORIGIN  Same as --additional-frontend-origin
 #   STACHE_ALLOW_PYPI_WITH_EXTENSION  Set to 1 to allow a PyPI layer build even
 #                               though an extension stack is deployed (normally
 #                               refused -- see below)
@@ -64,7 +78,8 @@ set -e
 #   sam deploy resolves any parameter it is NOT given to the TEMPLATE DEFAULT, not
 #   to the stack's current value, so omitting a flag on a redeploy would otherwise
 #   silently revert it. The settings above (all seven provider names, the embedding
-#   model, admin password auth) are therefore re-read from the deployed stack and
+#   model, admin password auth, frontend hosting mode, additional frontend origin)
+#   are therefore re-read from the deployed stack and
 #   re-sent when you do not pass them. Passing a flag / env var still wins.
 #
 #   This matters most for the provider names: an extension layer registers its own
@@ -100,6 +115,8 @@ COGNITO_CERT_ARN=""
 USE_COGNITO_DOMAIN=false
 FROM_SOURCE=""
 LOCAL_ENV_FILE=""
+FRONTEND_ENV_FILE=""
+CONFIRM_FRONTEND_TEARDOWN=false
 
 # Check environment variable for source builds
 if [[ -n "$STACHE_FROM_SOURCE" ]]; then
@@ -144,6 +161,33 @@ while [[ $# -gt 0 ]]; do
         --use-cognito-domain)
             USE_COGNITO_DOMAIN=true
             shift
+            ;;
+        --frontend-hosting)
+            # Exported so build_sam_params (lib/common.sh) forwards it as the
+            # FrontendHosting stack parameter.
+            export STACHE_FRONTEND_HOSTING="$2"
+            shift 2
+            ;;
+        --additional-frontend-origin)
+            if [[ "$2" != "none" && ! "$2" =~ ^https://[a-z0-9.-]+$ ]]; then
+                print_error "--additional-frontend-origin must be https://host (no path/slash) or none"
+                exit 1
+            fi
+            export STACHE_ADDITIONAL_FRONTEND_ORIGIN="$2"
+            shift 2
+            ;;
+        --confirm-frontend-teardown)
+            CONFIRM_FRONTEND_TEARDOWN=true
+            shift
+            ;;
+        --frontend-env)
+            if [[ -n "$2" ]] && [[ ! "$2" =~ ^- ]]; then
+                FRONTEND_ENV_FILE="$2"
+                shift 2
+            else
+                FRONTEND_ENV_FILE="-"
+                shift
+            fi
             ;;
         --skip-frontend)
             SKIP_FRONTEND=true
@@ -219,6 +263,34 @@ print_header "Deploying Stache to AWS"
 # Check AWS credentials
 check_aws_credentials || exit 1
 
+# Frontend hosting mode: sticky like the provider params (flag/env > deployed > default).
+FRONTEND_HOSTING=$(resolve_sticky_param "FrontendHosting" "${STACHE_FRONTEND_HOSTING:-}")
+FRONTEND_HOSTING="${FRONTEND_HOSTING:-cloudfront}"
+case "$FRONTEND_HOSTING" in
+    cloudfront|external) ;;
+    *) print_error "--frontend-hosting must be cloudfront or external (got $FRONTEND_HOSTING)"; exit 1 ;;
+esac
+if [[ -n "${STACHE_ADDITIONAL_FRONTEND_ORIGIN:-}" && "$STACHE_ADDITIONAL_FRONTEND_ORIGIN" != "none" \
+      && ! "$STACHE_ADDITIONAL_FRONTEND_ORIGIN" =~ ^https://[a-z0-9.-]+$ ]]; then
+    print_error "STACHE_ADDITIONAL_FRONTEND_ORIGIN must be https://host (no path/slash) or none"
+    exit 1
+fi
+
+# Handle --frontend-env (print the external-host env and exit; read-only)
+if [[ -n "$FRONTEND_ENV_FILE" ]]; then
+    if ! stack_exists "$STACK_NAME"; then
+        print_error "Stack $STACK_NAME does not exist"
+        exit 1
+    fi
+    get_frontend_config
+    if [[ "$FRONTEND_ENV_FILE" == "-" ]]; then
+        print_frontend_env
+    else
+        print_frontend_env "$FRONTEND_ENV_FILE"
+    fi
+    exit 0
+fi
+
 # Handle --local-env (generate config and exit)
 if [[ -n "$LOCAL_ENV_FILE" ]]; then
     print_header "Generating local environment config"
@@ -234,8 +306,8 @@ if [[ -n "$LOCAL_ENV_FILE" ]]; then
     exit 0
 fi
 
-# Handle custom domain
-if [[ -n "$DOMAIN" ]]; then
+# Handle custom domain (external hosting needs no ACM cert for the app domain)
+if [[ -n "$DOMAIN" && "$FRONTEND_HOSTING" == "cloudfront" ]]; then
     # Domain specified - look up certificate and verify it's validated
     if [[ -z "$CERT_ARN" ]]; then
         # No ARN provided, look it up by domain
@@ -363,6 +435,14 @@ if [[ "$SKIP_BACKEND" == false ]]; then
         get_existing_cognito_domain_config
     fi
 
+    if [[ "$FRONTEND_HOSTING" == "external" ]]; then
+        if [[ -z "$DOMAIN" || "$DOMAIN" == "None" ]]; then
+            print_error "--frontend-hosting external requires --domain <app hostname> (e.g. app.example.com)"
+            exit 1
+        fi
+        CONFIRM_FRONTEND_TEARDOWN="$CONFIRM_FRONTEND_TEARDOWN" confirm_frontend_teardown || exit 1
+    fi
+
     # Deploy
     deploy_sam_stack
 else
@@ -373,8 +453,18 @@ fi
 print_header "Getting stack outputs"
 get_frontend_config
 
+# What the stack actually is now (a --skip-backend run may not match the flag).
+# No output = a stack that predates FrontendHosting, i.e. cloudfront.
+DEPLOYED_HOSTING=$(get_stack_output "$STACK_NAME" "FrontendHosting")
+if [[ -z "$DEPLOYED_HOSTING" || "$DEPLOYED_HOSTING" == "None" ]]; then
+    DEPLOYED_HOSTING="cloudfront"
+fi
+
 # Build and deploy frontend
-if [[ "$SKIP_FRONTEND" == false ]]; then
+if [[ "$SKIP_FRONTEND" == false && "$DEPLOYED_HOSTING" == "external" ]]; then
+    print_warning "FrontendHosting=external: not building/uploading the frontend (deploy it on your static host)"
+    print_frontend_env
+elif [[ "$SKIP_FRONTEND" == false ]]; then
     # Find frontend source (priority order)
     FRONTEND_DIR=""
 

@@ -138,6 +138,26 @@ Parameters:
       CloudFront-backed regardless of pool region) for CognitoCustomDomain.
       Required if CognitoCustomDomain is set.
     Default: ""
+  FrontendHosting:
+    Type: String
+    Description: >-
+      Where the web frontend is served from. "cloudfront" (default) creates the
+      S3 bucket + CloudFront distribution and deploy.sh uploads the built app.
+      "external" creates neither: the app is hosted elsewhere at
+      https://<AppDomain> (AppDomain REQUIRED; CertificateArn unused). Cognito
+      callback/logout URLs and API CORS derive from AppDomain. Switching an
+      existing stack cloudfront -> external DELETES the bucket and distribution.
+    AllowedValues: ["cloudfront", "external"]
+    Default: "cloudfront"
+  AdditionalFrontendOrigin:
+    Type: String
+    Description: >-
+      Optional extra browser origin (https://host, no trailing slash), e.g. a
+      preview host, added to Cognito callback/logout URLs and API CORS in either
+      hosting mode. "" or "none" = no extra origin ("none" lets deploy.sh clear a
+      sticky value).
+    Default: ""
+    AllowedPattern: "^(|none|https://[a-z0-9.-]+)$"
   EnterpriseLayerArn:
     Type: String
     Description: >-
@@ -179,6 +199,17 @@ Conditions:
   UseCognitoCustomDomain: !Not [!Equals [!Ref CognitoCustomDomain, ""]]
   HasEnterpriseLayer: !Not [!Equals [!Ref EnterpriseLayerArn, ""]]
   UseAdminPasswordAuth: !Equals [!Ref EnableAdminPasswordAuth, "true"]
+  UseCloudFrontFrontend: !Equals [!Ref FrontendHosting, "cloudfront"]
+  HasAdditionalFrontendOrigin: !And
+    - !Not [!Equals [!Ref AdditionalFrontendOrigin, ""]]
+    - !Not [!Equals [!Ref AdditionalFrontendOrigin, "none"]]
+
+Rules:
+  ExternalFrontendNeedsAppDomain:
+    RuleCondition: !Equals [!Ref FrontendHosting, "external"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AppDomain, ""]]
+        AssertDescription: FrontendHosting=external requires AppDomain (the external app hostname)
 
 Globals:
   Function:
@@ -231,11 +262,19 @@ Globals:
         AI_ENRICHMENT_ENABLED: "true"
         ENABLE_SUMMARY_GENERATION: "false"
 
-        # CORS - allow CloudFront, custom domain, and localhost
-        CORS_ORIGINS: !If
-          - UseCustomDomain
-          - !Sub 'https://${AppDomain},https://${CloudFrontDistribution.DomainName},http://localhost:3000,http://localhost:8000'
-          - !Sub 'https://${CloudFrontDistribution.DomainName},http://localhost:3000,http://localhost:8000'
+        # CORS - allow the app origin(s) (custom domain and/or CloudFront, or the
+        # external host), localhost, and the optional additional origin. With the
+        # defaults this evaluates to exactly the pre-FrontendHosting string.
+        CORS_ORIGINS: !Sub
+          - '${FrontendList}http://localhost:3000,http://localhost:8000${ExtraOrigin}'
+          - FrontendList: !If
+              - UseCloudFrontFrontend
+              - !If
+                - UseCustomDomain
+                - !Sub 'https://${AppDomain},https://${CloudFrontDistribution.DomainName},'
+                - !Sub 'https://${CloudFrontDistribution.DomainName},'
+              - !Sub 'https://${AppDomain},'
+            ExtraOrigin: !If [HasAdditionalFrontendOrigin, !Sub ',${AdditionalFrontendOrigin}', '']
 
 Resources:
   # Lambda Layer with Stache packages
@@ -320,6 +359,7 @@ Resources:
   # S3 Bucket for frontend static files
   FrontendBucket:
     Type: AWS::S3::Bucket
+    Condition: UseCloudFrontFrontend
     Properties:
       BucketName: !Sub '${ResourcePrefix}-frontend-${AWS::AccountId}'
       PublicAccessBlockConfiguration:
@@ -331,6 +371,7 @@ Resources:
   # S3 Bucket Policy allowing CloudFront access
   FrontendBucketPolicy:
     Type: AWS::S3::BucketPolicy
+    Condition: UseCloudFrontFrontend
     Properties:
       Bucket: !Ref FrontendBucket
       PolicyDocument:
@@ -347,6 +388,7 @@ Resources:
   # CloudFront Origin Access Control for S3
   CloudFrontOriginAccessControl:
     Type: AWS::CloudFront::OriginAccessControl
+    Condition: UseCloudFrontFrontend
     Properties:
       OriginAccessControlConfig:
         Name: !Sub '${ResourcePrefix}-oac-${AWS::AccountId}'
@@ -357,6 +399,7 @@ Resources:
   # CloudFront Distribution for frontend
   CloudFrontDistribution:
     Type: AWS::CloudFront::Distribution
+    Condition: UseCloudFrontFrontend
     Properties:
       DistributionConfig:
         Enabled: true
@@ -508,8 +551,6 @@ Resources:
   # Cognito User Pool Client (web frontend)
   UserPoolClient:
     Type: AWS::Cognito::UserPoolClient
-    DependsOn:
-      - CloudFrontDistribution
     Properties:
       ClientName: !Sub '${AWS::StackName}-client'
       UserPoolId: !Ref UserPool
@@ -527,26 +568,23 @@ Resources:
         - openid
         - profile
       AllowedOAuthFlowsUserPoolClient: true
-      # Callback URLs - CloudFront + custom domain + localhost
-      CallbackURLs: !If
-        - UseCustomDomain
-        - - !Sub 'https://${AppDomain}'
-          - !Sub 'https://${AppDomain}/callback'
-          - !Sub 'https://${CloudFrontDistribution.DomainName}'
-          - !Sub 'https://${CloudFrontDistribution.DomainName}/callback'
-          - 'http://localhost:3000'
-          - 'http://localhost:3000/callback'
-        - - !Sub 'https://${CloudFrontDistribution.DomainName}'
-          - !Sub 'https://${CloudFrontDistribution.DomainName}/callback'
-          - 'http://localhost:3000'
-          - 'http://localhost:3000/callback'
-      LogoutURLs: !If
-        - UseCustomDomain
-        - - !Sub 'https://${AppDomain}'
-          - !Sub 'https://${CloudFrontDistribution.DomainName}'
-          - 'http://localhost:3000'
-        - - !Sub 'https://${CloudFrontDistribution.DomainName}'
-          - 'http://localhost:3000'
+      # Callback URLs - custom domain + CloudFront (cloudfront hosting only) +
+      # localhost + optional additional origin. Order matches the previous lists,
+      # so existing stacks see no change.
+      CallbackURLs:
+        - !If [UseCustomDomain, !Sub 'https://${AppDomain}', !Ref AWS::NoValue]
+        - !If [UseCustomDomain, !Sub 'https://${AppDomain}/callback', !Ref AWS::NoValue]
+        - !If [UseCloudFrontFrontend, !Sub 'https://${CloudFrontDistribution.DomainName}', !Ref AWS::NoValue]
+        - !If [UseCloudFrontFrontend, !Sub 'https://${CloudFrontDistribution.DomainName}/callback', !Ref AWS::NoValue]
+        - 'http://localhost:3000'
+        - 'http://localhost:3000/callback'
+        - !If [HasAdditionalFrontendOrigin, !Ref AdditionalFrontendOrigin, !Ref AWS::NoValue]
+        - !If [HasAdditionalFrontendOrigin, !Sub '${AdditionalFrontendOrigin}/callback', !Ref AWS::NoValue]
+      LogoutURLs:
+        - !If [UseCustomDomain, !Sub 'https://${AppDomain}', !Ref AWS::NoValue]
+        - !If [UseCloudFrontFrontend, !Sub 'https://${CloudFrontDistribution.DomainName}', !Ref AWS::NoValue]
+        - 'http://localhost:3000'
+        - !If [HasAdditionalFrontendOrigin, !Ref AdditionalFrontendOrigin, !Ref AWS::NoValue]
       SupportedIdentityProviders:
         - COGNITO
 
@@ -1150,17 +1188,17 @@ Resources:
   # separate OAuth scopes that break web frontend compatibility.
   StacheHttpApi:
     Type: AWS::Serverless::HttpApi
-    DependsOn: CloudFrontDistribution
     Properties:
       StageName: Prod
       CorsConfiguration:
         # PE feedback: Reduce preflight overhead with long MaxAge (24 hours)
         MaxAge: 86400
         AllowOrigins:
-          - !Sub 'https://${CloudFrontDistribution.DomainName}'
+          - !If [UseCloudFrontFrontend, !Sub 'https://${CloudFrontDistribution.DomainName}', !Ref AWS::NoValue]
           - !If [UseCustomDomain, !Sub 'https://${AppDomain}', !Ref AWS::NoValue]
           - 'http://localhost:3000'
           - 'http://localhost:8000'
+          - !If [HasAdditionalFrontendOrigin, !Ref AdditionalFrontendOrigin, !Ref AWS::NoValue]
         AllowMethods:
           - GET
           - POST
@@ -1287,14 +1325,17 @@ Outputs:
 
   # Frontend outputs
   FrontendBucketName:
+    Condition: UseCloudFrontFrontend
     Description: S3 bucket for frontend files
     Value: !Ref FrontendBucket
 
   CloudFrontDistributionId:
+    Condition: UseCloudFrontFrontend
     Description: CloudFront distribution ID
     Value: !Ref CloudFrontDistribution
 
   CloudFrontDomain:
+    Condition: UseCloudFrontFrontend
     Description: CloudFront distribution domain
     Value: !GetAtt CloudFrontDistribution.DomainName
 
@@ -1303,18 +1344,37 @@ Outputs:
     Value: !If [UseCustomDomain, !Ref AppDomain, '']
 
   FrontendUrl:
-    Description: Frontend URL (custom domain or CloudFront)
+    Description: Frontend URL (custom domain, CloudFront, or the external host)
     Value: !If
       - UseCustomDomain
       - !Sub 'https://${AppDomain}'
-      - !Sub 'https://${CloudFrontDistribution.DomainName}'
+      - !If [UseCloudFrontFrontend, !Sub 'https://${CloudFrontDistribution.DomainName}', '']
 
   LoginUrl:
     Description: Cognito login URL
-    Value: !If
-      - UseCustomDomain
-      - !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${UserPoolClient}&response_type=token&scope=email+openid+profile&redirect_uri=https://${AppDomain}'
-      - !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${UserPoolClient}&response_type=token&scope=email+openid+profile&redirect_uri=https://${CloudFrontDistribution.DomainName}'
+    Value: !Sub
+      - 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${UserPoolClient}&response_type=token&scope=email+openid+profile&redirect_uri=${Redirect}'
+      - Redirect: !If
+          - UseCustomDomain
+          - !Sub 'https://${AppDomain}'
+          - !If [UseCloudFrontFrontend, !Sub 'https://${CloudFrontDistribution.DomainName}', '']
+
+  FrontendHosting:
+    Description: cloudfront | external -- read by add-on deploy tooling to pick its publish path
+    Value: !Ref FrontendHosting
+
+  FrontendOrigins:
+    Description: Comma-separated browser origins trusted for CORS/callbacks (no localhost)
+    Value: !Sub
+      - '${Primary}${Extra}'
+      - Primary: !If
+          - UseCloudFrontFrontend
+          - !If
+            - UseCustomDomain
+            - !Sub 'https://${AppDomain},https://${CloudFrontDistribution.DomainName}'
+            - !Sub 'https://${CloudFrontDistribution.DomainName}'
+          - !Sub 'https://${AppDomain}'
+        Extra: !If [HasAdditionalFrontendOrigin, !Sub ',${AdditionalFrontendOrigin}', '']
 
   ApiFunctionRoleArn:
     Description: IAM role ARN for API Lambda (assume this for local dev)
